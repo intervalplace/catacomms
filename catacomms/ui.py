@@ -373,10 +373,14 @@ class DelveUI:
         if key == 17:                                    # ctrl+q
             self.running = False
             return
-        if isinstance(key, str) and key in ATTACK_KEYS:
+        # Letter controls (hjkl move, HJKL attack, d drop, space wait) act as
+        # game input only when the say/command line is empty. While composing a
+        # message they are ordinary text, or "/join" loses its "j". Arrow keys
+        # carry no text meaning, so they move regardless of what is typed.
+        if isinstance(key, str) and key in ATTACK_KEYS and not self.buffer:
             self._act("a", ATTACK_KEYS[key])
             return
-        if key in MOVE_KEYS:
+        if key in MOVE_KEYS and not (isinstance(key, str) and self.buffer):
             self._act("m", MOVE_KEYS[key])
             return
         if key == " " and not self.buffer:
