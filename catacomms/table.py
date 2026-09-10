@@ -46,6 +46,8 @@ class Table:
     diverged: set = field(default_factory=set)
     pending_send: list = field(default_factory=list)
     log: list = field(default_factory=list)
+    _last_input_send: float = 0.0    # when we last (re)broadcast our current input
+    _last_sent_tick: int = -1        # which tick that input was for
 
     # -- local play --------------------------------------------------------
 
@@ -55,6 +57,8 @@ class Table:
             return False
         self.inputs.setdefault(self.room.tick, {})[self.me] = action
         self.pending_send.append(f"{MSG_INPUT}|{self.room.tick}|{action}")
+        self._last_input_send = 0.0        # force a fresh send window
+        self._last_sent_tick = self.room.tick
         return True
 
     def has_acted(self) -> bool:
@@ -69,6 +73,41 @@ class Table:
     def _alive(self, pid: str) -> bool:
         entity = self.room.entities.get(pid)
         return entity is not None and entity.alive
+
+    def resend_due(self, now: float, interval: float = 4.0) -> None:
+        """Re-broadcast our inputs for any tick still missing somebody's move.
+
+        loraline sends application frames once and does not retransmit them, so
+        a dropped input would otherwise freeze a tick forever. A peer can be
+        stuck several ticks behind us, still missing an input we sent long ago,
+        so we resend our input for every tick from the lowest incomplete one up
+        to our own current tick, not just the current tick. Inputs are keyed by
+        tick and deduplicated on receipt, so resending only costs airtime and
+        can never double-apply. We keep our own inputs indefinitely for exactly
+        this reason.
+        """
+        if self.room.over:
+            return
+        if now - self._last_input_send < interval:
+            return
+        resent = False
+        for tick in sorted(self.inputs):
+            if tick > self.room.tick:
+                break
+            mine = self.inputs.get(tick, {}).get(self.me)
+            if mine is None:
+                continue
+            # Resend until every living player has published a hash for this
+            # tick, which is proof they advanced past it and therefore hold our
+            # input. Using our local input map instead would stop too early: we
+            # can advance because we got their input, while they are still
+            # missing ours and would hang.
+            done = self.hashes.get(tick, {})
+            if any(p not in done for p in self.players if self._alive(p)):
+                self.pending_send.append(f"{MSG_INPUT}|{tick}|{mine}")
+                resent = True
+        if resent:
+            self._last_input_send = now
 
     # -- the network -------------------------------------------------------
 

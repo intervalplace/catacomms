@@ -156,6 +156,13 @@ class Party:
     def tick(self) -> list:
         return self.table.advance() if self.table is not None else []
 
+    def resend(self, now: float) -> None:
+        """Give the table a chance to re-broadcast a stuck input. See
+        Table.resend_due: loraline does not retransmit application frames, so
+        without this a single dropped turn input hangs the delve forever."""
+        if self.table is not None:
+            self.table.resend_due(now)
+
     def leave(self) -> list:
         self.state, self.table = IDLE, None
         self.roster, self.accepted = {}, {}

@@ -91,6 +91,7 @@ def run(client: Client, warnings: list) -> None:
                     ui.note(f"{event.who}: {event.text}", "accent")
                 elif isinstance(event, SystemEvent):
                     ui.note(event.text, "warn" if event.level == "warn" else "muted")
+            party.resend(time.time())
             ui.absorb(party.tick())
             for payload in party.drain():
                 session.send_app(APP, payload)
@@ -177,6 +178,7 @@ def run_web(client: Client, warnings: list, port: int) -> None:
                 elif typed:
                     absorb(party.submit(typed))
 
+            party.resend(time.time())
             absorb(party.tick())
             for payload in party.drain():
                 session.send_app(APP, payload)
