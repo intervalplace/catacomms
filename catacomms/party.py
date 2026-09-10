@@ -56,6 +56,10 @@ class Party:
     accepted: dict = field(default_factory=dict)   # id -> name, while calling
     table: Table | None = None
     pending_send: list = field(default_factory=list)
+    _start_msg: str = ""          # the START we broadcast, resent until all arrive
+    _last_start_send: float = 0.0
+    _accept_msg: str = ""         # our ACCEPT, resent until the START names us
+    _last_accept_send: float = 0.0
 
     # -- calling one ------------------------------------------------------
 
@@ -79,7 +83,9 @@ class Party:
         if len(self.accepted) < 1:
             return [Event("note", text="Nobody is coming.")]
         roster = ",".join(f"{pid}:{name}" for pid, name in sorted(self.accepted.items()))
-        self.pending_send.append(f"{START}|{self.seed}|{roster}")
+        self._start_msg = f"{START}|{self.seed}|{roster}"
+        self.pending_send.append(self._start_msg)
+        self._last_start_send = 0.0
         return self._start(self.seed, dict(self.accepted))
 
     # -- answering one ----------------------------------------------------
@@ -87,7 +93,9 @@ class Party:
     def accept(self) -> list:
         if self.state != INVITED:
             return [Event("note", text="Nobody has called a delve.")]
-        self.pending_send.append(f"{ACCEPT}|{self.seed}")
+        self._accept_msg = f"{ACCEPT}|{self.seed}"
+        self._last_accept_send = 0.0
+        self.pending_send.append(self._accept_msg)
         return [Event("note", text=f"You are in. Waiting for {self.caller} to begin.")]
 
     def decline(self) -> list:
@@ -104,8 +112,19 @@ class Party:
         kind = parts[0] if parts else ""
 
         if kind == CALL and len(parts) >= 2:
-            if self.state == PLAYING:
-                return []
+            # Only an idle client can be invited. If we are already calling our
+            # own delve, playing one, or invited to someone else's, a fresh CALL
+            # must not clobber that state, or two overlapping calls leave both
+            # players pointed at different rooms and the turn-lock waits forever
+            # for an input meant for a room the other never built. The caller
+            # whose delve "wins" is simply whoever the others were idle for; the
+            # rest can /stay and re-answer, or the caller retries.
+            if self.state != IDLE:
+                if src == self.caller and parts[1] == self.seed:
+                    return []            # a duplicate of the call we already saw
+                return [Event("note", text=(
+                    f"{name_of(src)} is also calling a delve, but you are "
+                    f"already in one. Finish or leave it first."))]
             self.seed, self.caller, self.state = parts[1], src, INVITED
             return [Event("note", text=(
                 f"{name_of(src)} is calling a delve into room {parts[1]}. "
@@ -129,6 +148,10 @@ class Party:
                     roster[pid] = name or pid
             if self.me not in roster:
                 return []                 # a delve that is not ours
+            self._accept_msg = ""         # the caller heard us; stop resending
+            if self.state == PLAYING and self.table is not None \
+                    and self.seed == parts[1]:
+                return []                 # already in this room; START resent
             return self._start(parts[1], roster)
 
         if self.state == PLAYING and self.table is not None:
@@ -157,11 +180,33 @@ class Party:
         return self.table.advance() if self.table is not None else []
 
     def resend(self, now: float) -> None:
-        """Give the table a chance to re-broadcast a stuck input. See
-        Table.resend_due: loraline does not retransmit application frames, so
-        without this a single dropped turn input hangs the delve forever."""
-        if self.table is not None:
-            self.table.resend_due(now)
+        """Re-broadcast anything the handshake still needs. loraline does not
+        retransmit application frames, so a single dropped ACCEPT, START or
+        turn input would otherwise hang a delve forever."""
+        # Resend our ACCEPT until a START names us. An ACCEPT lost on the air
+        # means the caller begins without us and builds a room we are not in.
+        if self._accept_msg and now - self._last_accept_send >= 4.0:
+            self.pending_send.append(self._accept_msg)
+            self._last_accept_send = now
+        if self.table is None:
+            return
+        self.table.resend_due(now)
+        # The START message is also a fire-and-forget app frame. If it was
+        # dropped, a roster member never built the room and will never send an
+        # input, so the caller would wait forever. Keep re-broadcasting START
+        # until everyone has appeared in the table (any input or hash from
+        # them proves they got it). Building a room from a repeated START is
+        # idempotent: _start rebuilds the same deterministic room.
+        if self._start_msg and now - self._last_start_send >= 4.0:
+            seen = set(self.table.inputs.get(0, {})) | {
+                p for h in self.table.hashes.values() for p in h
+            }
+            missing = [p for p in self.roster if p != self.me and p not in seen]
+            if missing:
+                self.pending_send.append(self._start_msg)
+                self._last_start_send = now
+            else:
+                self._start_msg = ""      # everyone is in; stop resending
 
     def leave(self) -> list:
         self.state, self.table = IDLE, None
