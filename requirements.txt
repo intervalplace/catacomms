@@ -1,0 +1,6 @@
+# delve needs loraline for its transport. Clone it alongside, or:
+#   pip install pyserial pynacl
+# and put loraline on your PYTHONPATH.
+pyserial
+pynacl
+windows-curses; sys_platform == "win32"
