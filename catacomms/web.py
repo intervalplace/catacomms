@@ -41,6 +41,17 @@ class WebView:
             def log_message(self, *args):        # the terminal is not a log
                 pass
 
+            def handle(self):
+                # Browsers keep HTTP/1.1 sockets open and reset them freely; a
+                # reset mid-request surfaces as ConnectionResetError/BrokenPipe
+                # from deep in the stdlib parser, which would otherwise dump a
+                # traceback per closed tab. These are normal and carry no
+                # information, so drop them silently.
+                try:
+                    super().handle()
+                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                    pass
+
             def do_GET(self):
                 if self.path.startswith("/events"):
                     return view._stream(self)
@@ -205,10 +216,13 @@ input:focus{outline:2px solid var(--mark);outline-offset:1px}
 button{background:var(--panel);border:1px solid var(--rule);color:var(--ink);
        font:inherit;padding:8px 12px;border-radius:6px;cursor:pointer}
 button:active{background:var(--rule)}
-.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:230px;margin:0 auto}
+.controls{margin:10px auto 0;max-width:260px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
 .pad button{padding:12px 0}
-.hint{color:var(--faint);font-size:11px;text-align:center}
-@media(min-width:620px){.pad{display:none}}
+.pad button.on{background:var(--mark);color:#10161a;border-color:var(--mark)}
+.hint{color:var(--faint);font-size:11px;text-align:center;margin-top:8px}
+#board{cursor:default}
+#board.can{cursor:pointer}
 </style></head><body>
 <div class="wrap">
   <div class="bar"><h1><span>&#x2571;&#x2571;&#x2572;</span> catacomms</h1><span id="status"></span></div>
@@ -216,12 +230,15 @@ button:active{background:var(--rule)}
     <canvas id="board" width="352" height="288"></canvas>
     <div class="side" id="side"></div>
   </div>
-  <div class="pad">
-    <button data-k="drop">set down</button><button data-d="n">&#x2191;</button><button data-k="wait">wait</button>
-    <button data-d="w">&#x2190;</button><button data-k="atk">attack</button><button data-d="e">&#x2192;</button>
-    <button></button><button data-d="s">&#x2193;</button><button></button>
+  <div class="controls">
+    <div class="pad">
+      <button data-k="drop">set down</button><button data-d="n">&#x2191;</button><button data-k="wait">wait</button>
+      <button data-d="w">&#x2190;</button><button data-k="atk" id="atkbtn">attack</button><button data-d="e">&#x2192;</button>
+      <button></button><button data-d="s">&#x2193;</button><button></button>
+    </div>
+    <div class="hint">Click a square next to you to move there, or onto a monster to strike it.
+      Arrows/buttons also move; <b>attack</b> or a capital H/J/K/L strikes without moving. Space waits.</div>
   </div>
-  <div class="hint">tap a square next to you to step or strike</div>
   <div id="log"></div>
   <form id="say"><input id="text" placeholder="say something, or /delve" autocomplete="off"><button>send</button></form>
 </div>
@@ -273,6 +290,7 @@ function itemArt(name, kind){
 
 const board=document.getElementById('board'), ctx=board.getContext('2d');
 let state={}, prev={}, attackMode=false, moveAt=0, floats=[], flash={}, swings={};
+let hover=null;   // {x,y} cell the mouse is over, or null
 
 /* Sprites are baked once into offscreen canvases. Drawing 144 rectangles per
    entity per frame at sixty frames a second is how a battery dies. */
@@ -432,6 +450,28 @@ function draw(){
 
   const me=r.entities.find(e=>e.me);
   if(me&&me.alive&&!r.over){
+    // Show what the four neighbouring squares would do if clicked, so the
+    // board reads as a control surface rather than just a picture. A square
+    // holding a monster is a strike (red); an empty, non-wall square is a
+    // step (green). The one under the cursor gets a brighter fill.
+    const occupied={}; r.entities.filter(e=>e.alive).forEach(e=>occupied[e.x+','+e.y]=e);
+    [['w',-1,0],['e',1,0],['n',0,-1],['s',0,1]].forEach(([d,dx,dy])=>{
+      const nx=me.x+dx, ny=me.y+dy;
+      if(nx<0||ny<0||nx>=r.w||ny>=r.h) return;
+      if(isWall(nx,ny)) return;
+      const occ=occupied[nx+','+ny];
+      if(occ&&occ.kind==='player') return;         // never target an ally
+      const strike=occ&&occ.kind==='monster';
+      const hot=hover&&hover.x===nx&&hover.y===ny;
+      ctx.save();
+      ctx.fillStyle=strike?'#e06060':'#7fd08a';
+      ctx.globalAlpha=hot?0.34:0.16;
+      ctx.fillRect(nx*TILE+2,ny*TILE+2,TILE-4,TILE-4);
+      ctx.globalAlpha=hot?0.9:0.5; ctx.lineWidth=hot?2:1;
+      ctx.strokeStyle=strike?'#e06060':'#7fd08a';
+      ctx.strokeRect(nx*TILE+2.5,ny*TILE+2.5,TILE-5,TILE-5);
+      ctx.restore();
+    });
     const [px,py]=place(me);
     ctx.strokeStyle=attackMode?'#e06060':'#ea8fb4'; ctx.lineWidth=2;
     ctx.globalAlpha=0.55+0.35*Math.sin(now/380);
@@ -482,7 +522,8 @@ function render(){draw();side();log();
   document.getElementById('status').textContent=state.status||'';}
 
 const send=b=>fetch('/action',{method:'POST',body:b});
-const act=a=>{attackMode=false;send(a);draw();};
+const syncAtk=()=>{const b=document.getElementById('atkbtn'); if(b)b.classList.toggle('on',attackMode);};
+const act=a=>{attackMode=false;syncAtk();send(a);draw();};
 
 addEventListener('keydown',e=>{
   if(document.activeElement.tagName==='INPUT')return;
@@ -497,17 +538,40 @@ document.querySelectorAll('.pad button').forEach(b=>b.onclick=()=>{
   if(b.dataset.d) return act((attackMode?'a:':'m:')+b.dataset.d);
   if(b.dataset.k==='wait') return act('w');
   if(b.dataset.k==='drop') return act('d');
-  if(b.dataset.k==='atk'){attackMode=!attackMode;draw();}
+  if(b.dataset.k==='atk'){attackMode=!attackMode;syncAtk();draw();}
 });
+// Which grid cell an event points at, accounting for the canvas being scaled
+// down to fit its column.
+const cellAt=ev=>{
+  const r=state.room; if(!r)return null;
+  const box=board.getBoundingClientRect();
+  const gx=Math.floor((ev.clientX-box.left)/(box.width/r.w));
+  const gy=Math.floor((ev.clientY-box.top)/(box.height/r.h));
+  if(gx<0||gy<0||gx>=r.w||gy>=r.h)return null;
+  return {x:gx,y:gy};
+};
+// Is this cell an adjacent, actionable square (a step or a strike)?
+const actionableAt=c=>{
+  const r=state.room; if(!r||!c)return false;
+  const me=r.entities.find(e=>e.me); if(!me||!me.alive||r.over)return false;
+  if(Math.abs(c.x-me.x)+Math.abs(c.y-me.y)!==1)return false;
+  const there=r.entities.find(e=>e.alive&&e.x===c.x&&e.y===c.y);
+  return !(there&&there.kind==='player');   // anything but an ally
+};
+board.onmousemove=ev=>{
+  const c=cellAt(ev);
+  hover = actionableAt(c) ? c : null;
+  board.classList.toggle('can', !!hover);
+};
+board.onmouseleave=()=>{ hover=null; board.classList.remove('can'); };
 board.onclick=ev=>{
   const r=state.room; if(!r)return;
   const me=r.entities.find(e=>e.me); if(!me||!me.alive)return;
-  const box=board.getBoundingClientRect(), cell=box.width/r.w;
-  const gx=Math.floor((ev.clientX-box.left)/cell), gy=Math.floor((ev.clientY-box.top)/cell);
-  const dx=gx-me.x, dy=gy-me.y;
+  const c=cellAt(ev); if(!c)return;
+  const dx=c.x-me.x, dy=c.y-me.y;
   if(Math.abs(dx)+Math.abs(dy)!==1)return;
   const dir=dx>0?'e':dx<0?'w':dy>0?'s':'n';
-  const there=r.entities.find(e=>e.alive&&e.x===gx&&e.y===gy);
+  const there=r.entities.find(e=>e.alive&&e.x===c.x&&e.y===c.y);
   act((there&&there.kind==='monster'?'a:':'m:')+dir);
 };
 document.getElementById('say').onsubmit=e=>{
