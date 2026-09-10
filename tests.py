@@ -3,9 +3,9 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, '/home/claude/loraline')
 
-from delve import engine as E
-from delve.engine import Room, build, step, state_hash, encode_action
-from delve.table import Table, APP
+from catacomms import engine as E
+from catacomms.engine import Room, build, step, state_hash, encode_action
+from catacomms.table import Table, APP
 
 ok = lambda m: print(f"  ok  {m}")
 
@@ -171,7 +171,7 @@ ok(f"tampering is detected: {caught[0].text[:58]}...")
 
 
 # ---------- forming a party ----------
-from delve.party import Party, IDLE, CALLING, INVITED, PLAYING
+from catacomms.party import Party, IDLE, CALLING, INVITED, PLAYING
 
 names = {"a1b2c3": "hank", "d4e5f6": "dave", "091a2b": "mira", "ff0011": "lena"}
 name_of = lambda a: names.get(a, a)
@@ -266,5 +266,179 @@ allowed = replace_room = pair.__class__(**{**pair.__dict__, "friendly_fire": Tru
 after2, evs2 = step(allowed, {attacker: f"a:{direction}"})
 assert state_hash(after2) != state_hash(after), "the rule must be part of the state"
 ok("friendly fire is a room rule, and changing it changes the state hash")
+
+
+# ---------- items actually do something ----------
+from catacomms.engine import Item
+bare = E.Entity("p", "player", "hank", 1, 1, hp=20, max_hp=20, attack=6, armour=4)
+kitted = E.replace(bare, pack=(Item("weapon", "Red Edge", "named", 12),
+                               Item("armour", "Cold Mail", "named", 10),
+                               Item("charm", "Salt Bead", "named", 13)))
+assert (kitted.swing, kitted.guard, kitted.hp_cap) == (12, 10, 33)
+assert (bare.swing, bare.guard, bare.hp_cap) == (6, 4, 20)
+ok("weapon, armour and charm each change a stat that the engine reads")
+
+# picking a charm up mends you by what it adds
+hurt = E.replace(bare, hp=10)
+room_with_loot = E.replace(r1, entities={**r1.entities, "a1b2c3":
+                           E.replace(r1.entities["a1b2c3"], hp=10)})
+spot = None
+for d, (dx, dy) in E.DIRECTIONS.items():
+    p = (r1.entities["a1b2c3"].x + dx, r1.entities["a1b2c3"].y + dy)
+    if room_with_loot.passable(*p) and room_with_loot.at(*p) is None:
+        spot, way = p, d
+        break
+assert spot, "needed one open square next to the player"
+room_with_loot = E.replace(room_with_loot,
+                           floor={spot: (Item("charm", "Salt Bead", "rare", 10),)})
+after, evs = step(room_with_loot, {"a1b2c3": f"m:{way}"})
+me = after.entities["a1b2c3"]
+assert me.hp_cap == 30 and me.hp == 20, (me.hp, me.hp_cap)
+assert any(e.kind == "mend" for e in evs)
+ok("a charm raises the ceiling and mends you by the difference on pickup")
+
+# and none of that escapes the hash
+assert state_hash(after) != state_hash(step(room_with_loot, {"a1b2c3": "w"})[0])
+ok("carried items are part of the state, so a fabricated pack is divergence")
+
+
+# ---------- coin buys health at a shrine ----------
+shrine_room = next(build(f"shrine-{i}", PLAYERS) for i in range(50)
+                   if build(f"shrine-{i}", PLAYERS).shrines)
+sx, sy = sorted(shrine_room.shrines)[0]
+who = sorted(shrine_room.entities)[0]
+staged = E.replace(shrine_room, entities={
+    **shrine_room.entities,
+    who: E.replace(shrine_room.entities[who], x=sx, y=sy + 1, hp=8,
+                   pack=(Item("coin", "coins", "plain", 30),))})
+healed, evs = step(staged, {who: "m:n"})
+paid = healed.entities[who]
+assert paid.hp == paid.hp_cap and paid.coins == 30 - (paid.hp_cap - 8) * E.COIN_PER_HP
+assert any(e.kind == "shrine" for e in evs)
+assert (sx, sy) not in healed.shrines, "a shrine is spent when used"
+ok(f"a shrine turns coin into health at {E.COIN_PER_HP} for one, and is spent")
+
+# no coin, no mending, and the shrine is left standing
+broke = E.replace(staged, entities={**staged.entities,
+                  who: E.replace(staged.entities[who], pack=())})
+after_broke, _ = step(broke, {who: "m:n"})
+assert after_broke.entities[who].hp == 8
+assert (sx, sy) in after_broke.shrines
+ok("a shrine does nothing for someone with no coin, and stays for whoever has")
+
+assert state_hash(healed) != state_hash(after_broke)
+ok("shrines and coin are inside the state hash")
+
+
+# ---------- setting things down ----------
+holder = sorted(r1.entities)[0]
+armed = E.replace(r1, entities={**r1.entities, holder: E.replace(
+    r1.entities[holder],
+    pack=(Item("weapon", "Old Fang", "plain", 6),
+          Item("weapon", "Red Edge", "named", 12),
+          Item("coin", "coins", "plain", 20)))})
+spare = armed.entities[holder].spare()
+assert spare.name == "Old Fang", spare.name
+ok("the spare is the blade that does nothing for you, not the best one")
+
+put_down, evs = step(armed, {holder: "d"})
+me = put_down.entities[holder]
+here = put_down.floor[(me.x, me.y)]
+assert me.carried == 1 and me.coins == 20
+assert any(i.name == "Old Fang" for i in here)
+assert any(e.kind == "dropped" for e in evs)
+ok("dropping costs the turn and leaves the item where you stand, for anyone")
+
+# a full pack takes what fits and leaves the rest lying there
+stuffed = tuple(Item("charm", f"Bead {n}", "plain", 4) for n in range(E.PACK_LIMIT))
+spot = None
+for d, (dx, dy) in E.DIRECTIONS.items():
+    p = (r1.entities[holder].x + dx, r1.entities[holder].y + dy)
+    if r1.passable(*p) and r1.at(*p) is None:
+        spot, way = p, d
+        break
+loaded = E.replace(r1, entities={**r1.entities,
+                   holder: E.replace(r1.entities[holder], pack=stuffed)},
+                   floor={spot: (Item("weapon", "Bright Hook", "rare", 10),
+                                 Item("coin", "coins", "plain", 9))})
+after_full, evs = step(loaded, {holder: f"m:{way}"})
+carrier = after_full.entities[holder]
+assert carrier.carried == E.PACK_LIMIT, carrier.carried
+assert carrier.coins == 9, "coin always fits; it collapses to one entry"
+assert any(i.name == "Bright Hook" for i in after_full.floor.get(spot, ()))
+assert any(e.kind == "full" for e in evs)
+ok("a full pack takes the coin, leaves the item on the floor, and says so")
+
+
+# ---------- the room asks how many of you there are ----------
+for size in (1, 2, 3, 4):
+    party_of = [(f"p{i:05x}", f"player{i}") for i in range(size)]
+    sized = build("scaling", party_of)
+    assert len(sized.living("monster")) == size, (size, len(sized.living("monster")))
+ok("a room is built with one monster per person, so a lone delve is a delve")
+
+solo = build("scaling", [("aaa111", "hank")])
+trio = build("scaling", [("aaa111", "hank"), ("bbb222", "dave"), ("ccc333", "mira")])
+assert state_hash(solo) != state_hash(trio)
+ok("party size is part of the room, and so part of its hash")
+
+
+# ---------- reach, and choosing what to strike with ----------
+lane_room = build("reach-test", PLAYERS)
+shooter = sorted(lane_room.entities)[0]
+me0 = lane_room.entities[shooter]
+lane = [(me0.x + i, me0.y) for i in range(1, 5)]
+clear_walls = frozenset(set(lane_room.walls) - set(lane))
+others = {p: E.replace(lane_room.entities[p], x=1, y=lane_room.height - 2)
+          for p, _ in PLAYERS if p != shooter}
+far = E.Entity("m9", "monster", "ogre 9", me0.x + 4, me0.y,
+               hp=40, max_hp=40, attack=7, armour=0)
+staged = E.replace(lane_room, walls=clear_walls,
+                   entities={shooter: me0, **others, "m9": far})
+
+def strike(pack):
+    room = E.replace(staged, entities={**staged.entities,
+                     shooter: E.replace(me0, pack=pack)})
+    return step(room, {shooter: "a:e"})[1]
+
+assert not any(e.kind == "hit" for e in strike(()))
+assert not any(e.kind == "hit" for e in strike((Item("weapon", "Red Edge", "named", 12),)))
+assert any(e.kind == "hit" for e in strike((Item("weapon", "Cold Bow", "named", 12),)))
+ok("a blade cannot reach four squares and a bow can, with no change to the action")
+
+# a rod reaches three, so not four
+assert not any(e.kind == "hit" for e in strike((Item("weapon", "Salt Stave", "named", 12),)))
+ok("a rod reaches three squares, a bow four")
+
+# carrying both, the right one is used at each distance without any choosing
+both = (Item("weapon", "Red Edge", "named", 12), Item("weapon", "Cold Bow", "fine", 8))
+far_hits = [e for e in strike(both) if e.kind == "hit"]
+assert far_hits and far_hits[0].amount <= Item("weapon", "Cold Bow", "fine", 8).damage
+near = E.replace(staged, entities={**staged.entities,
+                 "m9": E.replace(far, x=me0.x + 1),
+                 shooter: E.replace(me0, pack=both)})
+near_events = [e for e in step(near, {shooter: "a:e"})[1] if e.kind == "hit"]
+assert near_events, "adjacent should connect"
+ok("the weapon that reaches is the weapon used, and the harder one when both do")
+
+# armour turns a blade or an arrow, never a rod
+armoured = E.replace(far, armour=20, hp=200)
+def versus(pack):
+    room = E.replace(staged, entities={**staged.entities, "m9": E.replace(armoured, x=me0.x + 2),
+                     shooter: E.replace(me0, pack=pack)})
+    return [e.kind for e in step(room, {shooter: "a:e"})[1] if e.kind in ("hit", "miss")]
+assert versus((Item("weapon", "Cold Bow", "named", 12),))[0] == "miss"
+assert versus((Item("weapon", "Salt Stave", "named", 12),))[0] == "hit"
+ok("armour turns arrows but never a rod, which is the whole reason a rod exists")
+
+# and a friend in the line is a friend you do not shoot
+blocked = E.replace(staged, entities={
+    **staged.entities,
+    "d4e5f6": E.replace(staged.entities["d4e5f6"], x=me0.x + 2, y=me0.y),
+    shooter: E.replace(me0, pack=(Item("weapon", "Cold Bow", "named", 12),))})
+evs = step(blocked, {shooter: "a:e"})[1]
+assert any(e.kind == "held" for e in evs), [e.kind for e in evs]
+assert not any(e.kind == "hit" for e in evs)
+ok("a friend standing in the line stops the shot, so where you stand matters")
 
 print("\nALL PASS")
