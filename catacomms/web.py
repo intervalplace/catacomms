@@ -387,7 +387,8 @@ function masonry(r,isWall){
     if(!isWall(x,y))continue;
     const px=x*TILE, py=y*TILE;
     const n=isWall(x,y-1), s=isWall(x,y+1), w=isWall(x-1,y), e=isWall(x+1,y);
-    ctx.fillStyle='#39464f'; ctx.fillRect(px,py,TILE,TILE);
+    ctx.fillStyle = r.kind==='camp' ? '#5d5a46' : '#39464f';
+    ctx.fillRect(px,py,TILE,TILE);
     const grain=hash(x+':'+y)%5;
     ctx.fillStyle=grain<2?'#3d4b55':'#354149';
     ctx.fillRect(px+(grain*5)%TILE, py+((grain*7)%TILE), 5, 3);
@@ -415,9 +416,14 @@ function draw(){
   for(let y=0;y<r.h;y++)for(let x=0;x<r.w;x++){
     if(isWall(x,y))continue;
     const px=x*TILE, py=y*TILE, v=hash(x+'x'+y);
-    ctx.fillStyle=((x+y)&1)?'#1b262c':'#1e2a31'; ctx.fillRect(px,py,TILE,TILE);
-    if(v%9<2){ctx.fillStyle='#26343c'; ctx.fillRect(px+(v%5)*4+2, py+((v>>3)%5)*4+2, 2, 2);}
-    if(v%17===0){ctx.fillStyle='#182229'; ctx.fillRect(px+(v%7)*3, py+((v>>4)%7)*3, 4, 2);}
+    const grass = r.kind==='camp';
+    ctx.fillStyle = grass ? (((x+y)&1)?'#33452f':'#384b33')
+                          : (((x+y)&1)?'#1b262c':'#1e2a31');
+    ctx.fillRect(px,py,TILE,TILE);
+    if(v%9<2){ctx.fillStyle=grass?'#44583c':'#26343c';
+      ctx.fillRect(px+(v%5)*4+2, py+((v>>3)%5)*4+2, 2, 2);}
+    if(v%17===0){ctx.fillStyle=grass?'#2b3a26':'#182229';
+      ctx.fillRect(px+(v%7)*3, py+((v>>4)%7)*3, 4, 2);}
     if(isWall(x,y-1)){ctx.fillStyle='rgba(0,0,0,0.30)'; ctx.fillRect(px,py,TILE,5);}
   }
   masonry(r,isWall);
@@ -474,7 +480,9 @@ function draw(){
     }
   });
 
-  ctx.drawImage(lighting(r,w,h),0,0);
+  // A clearing is above ground. Torchlight falloff there would say the sun
+  // had gone out.
+  if(r.kind!=='camp') ctx.drawImage(lighting(r,w,h),0,0);
 
   /* Somebody mid-action gets a ring that fills as the work goes on. This is
      the only place in the game where waiting is shown as something happening,
