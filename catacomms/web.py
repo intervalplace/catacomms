@@ -18,12 +18,16 @@ import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import records as R
+from .board_page import PAGE as BOARD_PAGE
 from .engine import PACK_LIMIT
 
 
 class WebView:
-    def __init__(self, port: int = 8080, host: str = "0.0.0.0") -> None:
+    def __init__(self, port: int = 8080, host: str = "0.0.0.0",
+                 records_dir=None) -> None:
         self.port, self.host = port, host
+        self.records_dir = records_dir
         self.inbox: "queue.Queue[str]" = queue.Queue()
         self._listeners: list = []
         self._lock = threading.Lock()
@@ -55,10 +59,26 @@ class WebView:
             def do_GET(self):
                 if self.path.startswith("/events"):
                     return view._stream(self)
-                body = PAGE.encode("utf-8")
+                # The node serves its own board, so there is nothing to
+                # export and nothing to keep up to date.
+                if self.path.startswith("/board.json"):
+                    data = (R.board(view.records_dir) if view.records_dir
+                            else R.board())
+                    return self._send(json.dumps(
+                        data, separators=(",", ":"), sort_keys=True
+                    ).encode("utf-8"), "application/json; charset=utf-8")
+                if self.path.rstrip("/") == "/board":
+                    return self._send(BOARD_PAGE.encode("utf-8"),
+                                      "text/html; charset=utf-8")
+                self._send(PAGE.encode("utf-8"), "text/html; charset=utf-8")
+
+            def _send(self, body: bytes, kind: str):
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", kind)
                 self.send_header("Content-Length", str(len(body)))
+                # A board is public arithmetic; a page on another host should
+                # be able to check it.
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -161,6 +181,8 @@ def snapshot(party, session, log, recent=()) -> dict:
         "floor": [{"x": x, "y": y, "n": len(items), "kind": items[0].kind,
                    "name": items[0].name, "tier": items[0].tier}
                   for (x, y), items in sorted(room.floor.items())],
+        "kind": room.kind,
+        "depth": room.depth,
         "acted": table.has_acted(),
         "waiting": [table.players.get(p, p) for p in table.waiting_for()],
         "entities": [],
@@ -174,6 +196,7 @@ def snapshot(party, session, log, recent=()) -> dict:
             "seat": order.index(eid) if eid in order else -1,
             "me": eid == party.me,
             "swing": e.swing, "guard": e.guard, "coins": e.coins,
+            "doing": e.doing, "until": e.busy_until,
             "pack": [{"label": i.label, "kind": i.kind, "tier": i.tier}
                      for i in e.pack if i.kind != "coin"],
         })
@@ -257,6 +280,10 @@ const HUES={"Ashen":"#b8bcc0","Pitted":"#8a7a62","Bright":"#e8dfa8","Cold":"#8fb
 const GLOW={"plain":null,"fine":"#9aa8b0","rare":"#a07fd8","named":"#e8c05f"};
 const SHAPE_PAL={"Stave":{"3":"#c8b06a"},"Wand":{"3":"#c8b06a"},"Spark":{"3":"#c8b06a"}};
 const MON={rat:'rat',goblin:'goblin',hound:'hound',ogre:'ogre'};
+const TREE=["....11......","...1111.....","..111111....",".11133111...",
+            "1111331111..",".11133111...","..111331....","...11331....",
+            "....221.....","....22......","...2222.....","..222222...."].join('');
+const TREE_PAL={'1':'#4f7a4a','2':'#6b4a2f','3':'#2f4a2c'};
 
 /* An item's picture comes out of the same roll as its name: the noun is the
    shape, the adjective is the hue, and the tier is a glow behind it. Twenty
@@ -307,6 +334,7 @@ function bake(name, pal, key){
   baked[key]=c; return c;
 }
 function spriteFor(e){
+  if(e.kind==='tree'){ ART.tree=TREE; return bake('tree', TREE_PAL, 'tree'); }
   if(e.kind==='player'){const s=SEATS[e.seat%SEATS.length];
     return bake('player', s, 'p'+(e.seat%SEATS.length));}
   const n=MON[e.name.split(' ')[0]]||'goblin';
@@ -448,6 +476,23 @@ function draw(){
 
   ctx.drawImage(lighting(r,w,h),0,0);
 
+  /* Somebody mid-action gets a ring that fills as the work goes on. This is
+     the only place in the game where waiting is shown as something happening,
+     and it is honest: sixty ticks of chopping really are passing, and nothing
+     is being transmitted while they do. */
+  r.entities.filter(e=>e.alive&&e.doing&&e.doing!=='done').forEach(e=>{
+    const [px,py]=place(e);
+    const span=Math.max(1, e.until - (prev.room? prev.room.tick : 0));
+    const left=Math.max(0, e.until - r.tick);
+    const done=Math.max(0, Math.min(1, 1 - left/span));
+    ctx.strokeStyle='rgba(232,161,63,0.30)'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(px+TILE/2, py+TILE/2, TILE*0.55, 0, 6.2832); ctx.stroke();
+    ctx.strokeStyle='#e8a13f';
+    ctx.beginPath();
+    ctx.arc(px+TILE/2, py+TILE/2, TILE*0.55, -1.5708, -1.5708+6.2832*done);
+    ctx.stroke();
+  });
+
   const me=r.entities.find(e=>e.me);
   if(me&&me.alive&&!r.over){
     // Show what the four neighbouring squares would do if clicked, so the
@@ -496,7 +541,8 @@ function draw(){
 function side(){
   const r=state.room, s=document.getElementById('side');
   if(!r){s.innerHTML='<div class="muted">'+(state.status||'')+'</div>';return;}
-  let h='<div class="muted">turn '+r.tick+' of '+r.limit+'</div>';
+  let h='<div class="muted">'+(r.kind==='camp'?'a clearing':'depth '+r.depth)
+        +' &middot; turn '+r.tick+' of '+r.limit+'</div>';
   const bar=(e,c)=>'<div class="hp"><i style="width:'+Math.max(0,Math.round(100*e.hp/e.cap))
     +'%;background:'+c+'"></i></div>';
   r.entities.filter(e=>e.kind==='player').forEach(e=>{

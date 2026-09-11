@@ -17,18 +17,20 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-from .engine import Event, build
+from . import records as R
+from .engine import Event, build, build_camp
 from .table import APP, Table
 
 # Lobby wire forms. Short, because they cross the same radio as everything else.
 #   v|<seed>                        a delve is called
 #   y|<seed>                        I am coming
 #   n|<seed>                        I am not
-#   s|<seed>|<id>:<name>,<id>:<name>  the roster is fixed; build this room
+#   s|<seed>|<id>:<name>,...|<kind>|<depth>|<torches>   the roster is fixed
 CALL = "v"
 ACCEPT = "y"
 DECLINE = "n"
 START = "s"
+SIGN = "g"        # g|<record id>|<signature>
 
 IDLE, CALLING, INVITED, PLAYING = "idle", "calling", "invited", "playing"
 
@@ -60,16 +62,31 @@ class Party:
     _last_start_send: float = 0.0
     _accept_msg: str = ""         # our ACCEPT, resent until the START names us
     _last_accept_send: float = 0.0
+    record: object = None
+    identity: object = None
+    keyring: object = None
+    on_air: object = None       # callable: address -> was heard on the radio
+    store: object = None        # where records are kept
+    afford: object = None       # callable: may we spend a frame yet
+    depth: int = 1
+    torches: int = 0
+    kind: str = "delve"
+    # Signatures can arrive before this machine has closed out its own record,
+    # because rooms end on whichever move lands last. Held rather than dropped,
+    # or whoever finishes last would lose their witnesses.
+    early: dict = field(default_factory=dict)
 
     # -- calling one ------------------------------------------------------
 
-    def call(self, salt: str, my_name: str = "") -> list:
+    def call(self, salt: str, my_name: str = "", depth: int = 1,
+             torches: int = 0, kind: str = "delve") -> list:
         if self.state == PLAYING:
             return [Event("note", text="You are already in a delve.")]
         self.my_name = my_name or self.my_name
         self.seed = make_seed(self.me, salt)
         self.caller = self.me
         self.state = CALLING
+        self.depth, self.torches, self.kind = max(1, depth), max(0, torches), kind
         self.accepted = {self.me: self.my_name}
         self.pending_send.append(f"{CALL}|{self.seed}")
         return [Event("note", text=(
@@ -83,10 +100,12 @@ class Party:
         if len(self.accepted) < 1:
             return [Event("note", text="Nobody is coming.")]
         roster = ",".join(f"{pid}:{name}" for pid, name in sorted(self.accepted.items()))
-        self._start_msg = f"{START}|{self.seed}|{roster}"
+        self._start_msg = (f"{START}|{self.seed}|{roster}"
+                           f"|{self.kind}|{self.depth}|{self.torches}")
         self.pending_send.append(self._start_msg)
         self._last_start_send = 0.0
-        return self._start(self.seed, dict(self.accepted))
+        return self._start(self.seed, dict(self.accepted),
+                           self.kind, self.depth, self.torches)
 
     # -- answering one ----------------------------------------------------
 
@@ -157,9 +176,30 @@ class Party:
             self.accepted.pop(src, None)
             return [Event("note", text=f"{name_of(src)} stayed behind.")]
 
+        if kind == SIGN and len(parts) == 3:
+            if self.record is None:
+                self.early[src] = (parts[1], parts[2])
+                return []
+            if parts[1] != self.record.id:
+                return []
+            if not self.record.accept(src, parts[2], self.keyring):
+                return [Event("note", text=(
+                    f"{name_of(src)} sent a signature that does not check out. "
+                    f"Nothing of theirs is being counted."))]
+            R.save(self.record, self.store) if self.store else R.save(self.record)
+            seen = len(self.record.witnesses(self.keyring))
+            return [Event("note", text=(
+                f"{name_of(src)} signed for the delve "
+                f"({seen} of {len(self.roster)} witnesses)."))]
+
         if kind == START and len(parts) == 3:
+            tail = parts[2].split("|")
+            roster_text = tail[0]
+            place = tail[1] if len(tail) > 1 else "delve"
+            depth = int(tail[2]) if len(tail) > 2 and tail[2].isdigit() else 1
+            torches = int(tail[3]) if len(tail) > 3 and tail[3].isdigit() else 0
             roster = {}
-            for pair in parts[2].split(","):
+            for pair in roster_text.split(","):
                 pid, _, name = pair.partition(":")
                 if pid:
                     roster[pid] = name or pid
@@ -169,32 +209,88 @@ class Party:
             if self.state == PLAYING and self.table is not None \
                     and self.seed == parts[1]:
                 return []                 # already in this room; START resent
-            return self._start(parts[1], roster)
+            return self._start(parts[1], roster, place, depth, torches)
 
         if self.state == PLAYING and self.table is not None:
-            return self.table.on_payload(src, payload)
+            # A room usually ends on somebody else's move arriving rather than
+            # on your own clock, so the record has to be closed out here too.
+            return self.table.on_payload(src, payload) + self.close_out()
         return []
 
-    def _start(self, seed: str, roster: dict) -> list:
+    def _start(self, seed: str, roster: dict, kind: str = "delve",
+               depth: int = 1, torches: int = 0) -> list:
         self.seed, self.roster, self.state = seed, roster, PLAYING
-        room = build(seed, sorted(roster.items()))
+        self.kind, self.depth, self.torches = kind, depth, torches
+        if kind == "camp":
+            room = build_camp(seed, sorted(roster.items()))
+        else:
+            room = build(seed, sorted(roster.items()), depth=depth, torches=torches)
         self.table = Table(room, self.me, roster)
         names = ", ".join(roster[p] for p in sorted(roster))
+        if kind == "camp":
+            trees = len([e for e in room.entities.values() if e.kind == "tree"])
+            return [Event("note", text=(
+                f"A clearing, {names}. {trees} worth cutting. "
+                f"c and a direction to start, x when you are done."))]
         return [Event("note", text=(
-            f"Room {seed}. The party is {names}. "
-            f"{len(room.living('monster'))} down there with you."))]
+            f"Room {seed}, depth {depth}. The party is {names}. "
+            f"{len(room.living('monster'))} down there, and light for "
+            f"{room.limit} turns."))]
 
     # -- play -------------------------------------------------------------
 
     def submit(self, action: str) -> list:
         if self.state != PLAYING or self.table is None:
             return []
+        # The radio has to be able to afford the frame. At one percent duty a
+        # party acting as fast as it can decide burns eight times the hourly
+        # allowance and jams within minutes, so the client paces itself rather
+        # than discovering the wall.
+        if self.afford is not None and not self.afford():
+            return [Event("note", text="The radio is still recovering.")]
         if not self.table.submit(action):
             return []
-        return self.table.advance()
+        return self.table.advance() + self.close_out()
 
     def tick(self) -> list:
-        return self.table.advance() if self.table is not None else []
+        if self.table is None:
+            return []
+        return self.table.advance() + self.close_out()
+
+    def close_out(self) -> list:
+        """When the room ends, write down what happened and sign it.
+
+        Everyone present builds the same record from the same final state, so
+        the signatures are over identical bytes without the record itself ever
+        being sent. Only the signature crosses the radio.
+        """
+        if (self.table is None or not self.table.room.over
+                or self.record is not None or self.identity is None):
+            return []
+        air = {a: bool(self.on_air(a)) if self.on_air else False for a in self.roster}
+        air[self.me] = True          # you were certainly where you were
+        self.record = R.build(self.table.room, self.roster, air)
+        signature = self.record.sign(self.identity)
+        self.pending_send.append(f"{SIGN}|{self.record.id}|{signature}")
+
+        events: list = []
+        for who, (record_id, sig) in list(self.early.items()):
+            if record_id != self.record.id:
+                continue
+            if self.record.accept(who, sig, self.keyring):
+                events.append(Event("note", text=(
+                    f"{self.roster.get(who, who)} had already signed for it.")))
+            self.early.pop(who, None)
+        R.save(self.record, self.store) if self.store else R.save(self.record)
+
+        mine = self.record.carried.get(self.me, [])
+        goods = [i["name"] for i in mine if i["kind"] != "coin"]
+        coin = sum(i["value"] for i in mine if i["kind"] == "coin")
+        haul = ", ".join(goods) if goods else "nothing"
+        return events + [Event("note", text=(
+            f"Record {self.record.id}: {self.table.room.outcome}. "
+            f"You carried out {haul}"
+            + (f" and {coin} coin." if coin else ".")))]
 
     def resend(self, now: float) -> None:
         """Re-broadcast anything the handshake still needs. loraline does not
@@ -226,8 +322,10 @@ class Party:
                 self._start_msg = ""      # everyone is in; stop resending
 
     def leave(self) -> list:
-        self.state, self.table = IDLE, None
+        self.state, self.table, self.record = IDLE, None, None
         self.roster, self.accepted = {}, {}
+        self.kind, self.depth, self.torches = "delve", 1, 0
+        self.early.clear()
         return [Event("note", text="You are out of the delve.")]
 
     def drain(self) -> list:

@@ -28,6 +28,7 @@ BASIC = {"person": [curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_MAGENTA,
 ROLES = ("accent", "muted", "rule", "warn", "danger")
 
 DROP_KEY = "d"
+CHOP_KEYS = {"c": True}
 MOVE_KEYS = {"k": "n", "j": "s", "l": "e", "h": "w",
              curses.KEY_UP: "n", curses.KEY_DOWN: "s",
              curses.KEY_RIGHT: "e", curses.KEY_LEFT: "w"}
@@ -38,7 +39,9 @@ HELP = [
     "d sets down the item you need least, for whoever is behind you to pick up.",
     "/tiles switches between letters and pixels. Letters are faster to read; "
     "pixels are nicer to look at.",
-    "/delve calls one, /begin sets off, /join and /stay answer somebody else's.",
+    "/delve calls one, /delve 3 2 goes deeper carrying two torches, /begin sets off.",
+    "/camp goes above ground to cut wood. c and a direction chops, x when done.",
+    "/stash shows what you can prove you own. Only witnessed delves count.",
     "Anything else you type is said out loud to the party.",
 ]
 
@@ -131,6 +134,7 @@ class DelveUI:
         self.on_say = lambda text: None
         self.on_command = lambda text: []
         self.tiles = False
+        self.chopping = False
         self.pairs = Pairs()
 
     # -- log ---------------------------------------------------------------
@@ -300,6 +304,10 @@ class DelveUI:
             room = party.table.room
             phase = "gathering" if room.sweeping else f"turn {room.tick} of {room.limit}"
             lines.append([(phase, "accent" if room.sweeping else "muted")])
+            mine = room.entities.get(party.me)
+            if mine is not None and mine.doing and mine.doing != "done":
+                left = max(0, mine.busy_until - room.tick)
+                lines.append([(f"{mine.doing.split(':')[0]}, {left} left", "accent")])
             lines.append([("", "muted")])
             lines.append([("\u2500\u2500 party \u2500\u2500", "rule")])
             for eid in sorted(party.table.players):
@@ -381,6 +389,10 @@ class DelveUI:
             self._act("a", ATTACK_KEYS[key])
             return
         if key in MOVE_KEYS and not (isinstance(key, str) and self.buffer):
+            if self.chopping:
+                self.chopping = False
+                self._act("c", MOVE_KEYS[key])
+                return
             self._act("m", MOVE_KEYS[key])
             return
         if key == " " and not self.buffer:
@@ -388,6 +400,13 @@ class DelveUI:
             return
         if key == DROP_KEY and not self.buffer:
             self._act("d", "")
+            return
+        if key == "c" and not self.buffer:
+            self.chopping = not self.chopping
+            self.note("Chop which way?" if self.chopping else "Never mind.")
+            return
+        if key == "x" and not self.buffer:
+            self._act("x", "")
             return
         if key in (curses.KEY_ENTER, "\n", "\r", 10, 13):
             text, self.buffer = self.buffer.strip(), ""
@@ -411,7 +430,7 @@ class DelveUI:
         if self.party.table.has_acted():
             self.note("You have already moved this turn.")
             return
-        action = verb if verb in ("w", "d") else f"{verb}:{direction}"
+        action = verb if verb in ("w", "d", "x") else f"{verb}:{direction}"
         self.absorb(self.party.submit(action))
 
     # -- plumbing ----------------------------------------------------------

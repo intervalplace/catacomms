@@ -196,6 +196,11 @@ class Entity:
     armour: int = 0      # chance to be missed, out of 20
     pack: tuple = ()     # what you are carrying; best of each is what you use
     drop: tuple = ()     # what falls when this dies
+    busy_until: int = 0  # the tick at which a long action finishes
+    doing: str = ""      # what is being done until then, e.g. "chop:n"
+
+    def due(self, tick: int) -> bool:
+        return tick >= self.busy_until
 
     @property
     def alive(self) -> bool:
@@ -278,10 +283,12 @@ class Room:
     height: int
     walls: frozenset
     entities: dict           # id -> Entity, always read in sorted order
+    kind: str = "delve"                         # delve | camp
     floor: dict = field(default_factory=dict)   # (x, y) -> tuple of Items
     shrines: frozenset = frozenset()            # spent when used
     tick: int = 0
-    limit: int = 60          # turns before the party has to leave
+    depth: int = 1           # how far down; deeper is worse and richer
+    limit: int = 20          # turns before the light gives out
     friendly_fire: bool = False
     log: tuple = ()
 
@@ -306,8 +313,16 @@ class Room:
         when the room is quiet and everything has been picked up.
 
         Not the instant the last monster falls: gathering what you killed for
-        is part of the delve, and the turn limit is what keeps it honest."""
-        if not self.living("player") or self.tick >= self.limit:
+        is part of the delve, and the turn limit is what keeps it honest.
+
+        A camp has nothing to kill, so it ends when the light does or when
+        everybody has said they are finished."""
+        if self.tick >= self.limit:
+            return True
+        if self.kind == "camp":
+            people = self.living("player")
+            return bool(people) and all(p.doing == "done" for p in people)
+        if not self.living("player"):
             return True
         return not self.living("monster") and not self.floor
 
@@ -320,6 +335,11 @@ class Room:
         """Monsters down, loot still on the floor, torches still burning."""
         return (not self.living("monster") and bool(self.floor)
                 and bool(self.living("player")) and self.tick < self.limit)
+
+    def due_players(self) -> list:
+        """Who the world is waiting on. Somebody twelve ticks into a chop is
+        not waited for, which is the point of giving actions a length."""
+        return [p for p in self.living("player") if p.due(self.tick)]
 
     @property
     def outcome(self) -> str:
@@ -362,6 +382,10 @@ def parse_action(text: str) -> tuple:
         return ("attack", text[2])
     if text == "d":
         return ("drop", "")
+    if text.startswith("c:") and text[2:3] in DIRECTIONS:
+        return ("chop", text[2])
+    if text == "x":
+        return ("leave", "")
     return ("wait", "")
 
 
@@ -372,6 +396,10 @@ def encode_action(verb: str, direction: str = "") -> str:
         return f"a:{direction}"
     if verb == "drop":
         return "d"
+    if verb == "chop":
+        return f"c:{direction}"
+    if verb == "leave":
+        return "x"
     return "w"
 
 
@@ -403,6 +431,27 @@ def step(room: Room, inputs: dict) -> tuple:
         if not actor.alive:
             return
         verb, direction = action
+        if verb == "chop":
+            dx2, dy2 = DIRECTIONS[direction]
+            tree = _at(actor.x + dx2, actor.y + dy2)
+            if tree is None or tree.kind != "tree" or not tree.alive:
+                events.append(Event("blocked", actor_id,
+                                    text=f"{actor.name} finds nothing to cut there"))
+                return
+            entities[actor_id] = replace(
+                actor, doing=f"chop:{direction}",
+                busy_until=room.tick + ACTION_UNITS["chop"])
+            events.append(Event("working", actor_id, tree.id,
+                                ACTION_UNITS["chop"],
+                                f"{actor.name} sets to work on the {tree.name}"))
+            return
+
+        if verb == "leave":
+            entities[actor_id] = replace(actor, doing="done")
+            events.append(Event("note", actor_id,
+                                text=f"{actor.name} is done here"))
+            return
+
         if verb == "drop":
             spare = actor.spare()
             if spare is None:
@@ -558,8 +607,32 @@ def step(room: Room, inputs: dict) -> tuple:
                 return entity
         return None
 
+    # Anything that finishes on this tick pays out first.
     for eid in sorted(entities):
-        if entities[eid].kind == "player" and entities[eid].alive:
+        actor = entities[eid]
+        if not actor.doing or actor.doing == "done" or actor.busy_until > room.tick:
+            continue
+        verb, _, direction = actor.doing.partition(":")
+        entities[eid] = replace(actor, doing="", busy_until=room.tick)
+        if verb == "chop":
+            dx, dy = DIRECTIONS.get(direction, (0, 0))
+            tree = _at(actor.x + dx, actor.y + dy)
+            if tree is not None and tree.kind == "tree" and tree.alive:
+                entities[tree.id] = replace(tree, hp=tree.hp - 1)
+                log = Item("wood", "log", "plain", WOOD_PER_CHOP)
+                entities[eid] = replace(entities[eid], pack=entities[eid].pack + (log,))
+                events.append(Event("chopped", eid, tree.id, WOOD_PER_CHOP,
+                                    f"{actor.name} cuts a log from the {tree.name}"))
+                if entities[tree.id].hp <= 0:
+                    events.append(Event("felled", eid, tree.id,
+                                        text=f"the {tree.name} comes down"))
+            else:
+                events.append(Event("blocked", eid,
+                                    text=f"{actor.name} has nothing left to cut"))
+
+    for eid in sorted(entities):
+        actor = entities[eid]
+        if actor.kind == "player" and actor.alive and actor.due(room.tick):
             resolve(eid, parse_action(inputs.get(eid, "w")))
 
     for eid in sorted(entities):
@@ -568,7 +641,27 @@ def step(room: Room, inputs: dict) -> tuple:
             continue
         resolve(eid, _monster_action(monster, entities, _passable, _at))
 
+    # If nothing hostile is about and nobody who could act wants to, there is
+    # no reason to grind through the ticks one at a time: jump to whenever the
+    # next thing actually happens.
+    #
+    # Without this, one person chopping for sixty ticks obliges everybody else
+    # to send sixty waits, which is sixty frames of airtime to watch somebody
+    # work. Waiting therefore means waiting until something happens, and costs
+    # one frame however long that turns out to be. With a monster alive it
+    # never fires, because a monster is due every tick.
     tick = room.tick + 1
+    if not room.living("monster"):
+        pending = [e.busy_until for e in entities.values()
+                   if e.kind == "player" and e.alive and e.doing
+                   and e.doing != "done" and e.busy_until > tick]
+        idle = all(
+            e.doing == "done" or not e.due(room.tick)
+            or parse_action(inputs.get(e.id, "w"))[0] == "wait"
+            for e in entities.values()
+            if e.kind == "player" and e.alive)
+        if pending and idle:
+            tick = min(pending)
     advanced = replace(room, entities=entities, floor=floor,
                        shrines=frozenset(shrines), tick=tick,
                        log=room.log + tuple(e.text for e in events))
@@ -632,7 +725,7 @@ def canonical(room: Room) -> bytes:
     nothing else. The log is excluded: it is a rendering of history, not part
     of the state, and two players may hold different amounts of it."""
     parts = [f"{room.seed}|{room.width}x{room.height}|{room.tick}/{room.limit}"
-             f"|ff{int(room.friendly_fire)}"]
+             f"|ff{int(room.friendly_fire)}|d{room.depth}"]
     parts.append(",".join(f"{x}.{y}" for x, y in sorted(room.walls)))
     for eid in sorted(room.entities):
         e = room.entities[eid]
@@ -641,6 +734,11 @@ def canonical(room: Room) -> bytes:
     for spot in sorted(room.floor):
         parts.append(f"@{spot[0]}.{spot[1]}:{_items(room.floor[spot])}")
     parts.append("+" + ",".join(f"{x}.{y}" for x, y in sorted(room.shrines)))
+    parts.append(room.kind)
+    for eid in sorted(room.entities):
+        e = room.entities[eid]
+        if e.doing or e.busy_until:
+            parts.append(f"~{e.id}:{e.doing}:{e.busy_until}")
     return "|".join(parts).encode("utf-8")
 
 
@@ -660,11 +758,30 @@ def state_hash(room: Room) -> str:
 
 COIN_PER_HP = 2
 
+# How long an action takes, in ticks. A tick is about a second of wall time.
+#
+# This is the whole pacing mechanism. At one percent duty every millisecond
+# transmitted owes a hundred of silence, so a party swinging at each other
+# every four seconds burns eight times the hourly allowance and jams. An
+# action that covers sixty ticks costs the same single frame as one that
+# covers one, which makes fighting expensive per second of game time and
+# working nearly free.
+#
+# Sixty for a chop is not a taste decision. A thirty-character line of chat
+# costs about as much airtime as an action, and the budget grants ten
+# milliseconds a second, so a minute of work is the length at which the work
+# pays for the conversation that happens over it.
+ACTION_UNITS = {"move": 1, "attack": 1, "drop": 1, "wait": 1, "leave": 1,
+                "chop": 60}
+WOOD_PER_CHOP = 1
+
 # What a person can carry, not counting coin, which collapses to one entry.
 # Generous on purpose: in a single room it almost never binds. It exists so
 # that dropping has teeth once delves start chaining, and so that a pack is a
 # thing with edges rather than a list that only grows.
 PACK_LIMIT = 6
+
+TREES = ["pine", "birch", "ash", "thorn", "rowan"]
 
 MONSTERS = [
     ("rat", 6, 3, 2),
@@ -691,8 +808,46 @@ def reachable_from(width: int, height: int, walls: set, start: tuple) -> set:
     return seen
 
 
-def build(seed: str, players: list, width: int = 11, height: int = 9,
-          monster_count: int | None = None) -> Room:
+def build_camp(seed: str, players: list, width: int = 13, height: int = 9,
+               trees: int | None = None) -> Room:
+    """A place above ground with things to cut and nothing that bites.
+
+    The same engine, the same grid, the same turn lock. The only new content is
+    an entity kind that is worked rather than fought, which is why a camp costs
+    almost no code: a camp is a room whose monsters are trees and whose danger
+    is that you are not delving.
+    """
+    if trees is None:
+        trees = max(2, len(players) + 1)
+    room = build(seed, players, width, height, monster_count=0)
+    free = [(x, y) for y in range(1, height - 1) for x in range(1, width - 1)
+            if (x, y) not in room.walls and room.at(x, y) is None]
+    rng = Rng(seed_for(seed, -2))
+    entities = dict(room.entities)
+    for index in range(trees):
+        if not free:
+            break
+        spot = free.pop(rng.below(len(free)))
+        logs = 3 + rng.below(3)
+        tid = f"t{index}"
+        entities[tid] = Entity(tid, "tree", f"{TREES[rng.below(len(TREES))]}",
+                               spot[0], spot[1], hp=logs, max_hp=logs,
+                               attack=0, armour=0)
+    # Light lasts longer above ground, and a camp is not a race.
+    return replace(room, kind="camp", entities=entities,
+                   shrines=frozenset(), floor={}, limit=600)
+
+
+# Light was a stalemate guard at sixty ticks, which no room ever came close to
+# using, so torches bought nothing. Tightened until running out is a real way
+# to lose, which is the only thing that makes carrying more of them a decision.
+BASE_LIGHT = 20
+TORCH_TICKS = 7          # how much further one torch carries you
+
+
+def build(seed: str, players: list, width: int = 0, height: int = 0,
+          monster_count: int | None = None, depth: int = 1,
+          torches: int = 0) -> Room:
     """Generate a room from a seed. Same seed, same room, on every machine.
 
     `players` is a list of (id, name); ids are normally loraline addresses.
@@ -707,8 +862,18 @@ def build(seed: str, players: list, width: int = 11, height: int = 9,
     of four almost unkillable. The roster is in the start message, so every
     machine already knows how many are coming and builds the same room.
     """
+    # Deeper rooms are bigger, which is what finally makes light a real
+    # constraint rather than a stalemate timer: at depth one a party is done
+    # in sixteen turns of sixty and never thinks about torches.
+    depth = max(1, depth)
+    width = width or 11 + 2 * (depth - 1)
+    height = height or 9 + (depth - 1)
     if monster_count is None:
-        monster_count = max(1, len(players))
+        # One each, and one more every second step down. Steeper than this
+        # and depth four is a hundred percent casualties, because a party
+        # cannot yet carry anything down with them to meet it.
+        monster_count = max(1, len(players)) + max(0, depth - 1) // 2
+    monster_count = max(0, monster_count)
     rng = Rng(seed_for(seed, -1))
     walls = set()
     for x in range(width):
@@ -747,11 +912,14 @@ def build(seed: str, players: list, width: int = 11, height: int = 9,
         if not free:
             break
         spot = free.pop(rng.below(len(free)))
-        kind, hp, attack, armour = MONSTERS[rng.below(len(MONSTERS))]
+        # The weakest things stop appearing as you go down, but slowly.
+        floor_index = min(len(MONSTERS) - 1, max(0, depth - 1) // 2)
+        choices = MONSTERS[floor_index:] or MONSTERS
+        kind, hp, attack, armour = choices[rng.below(len(choices))]
         mid = f"m{index}"
         # Tougher things carry better things. Decided here, once, from the
         # seed, so every machine already knows what is down there.
-        drop = (roll_item(rng, depth=hp),) if rng.below(100) < 70 else ()
+        drop = (roll_item(rng, depth=hp + depth * 6),) if rng.below(100) < 70 else ()
         entities[mid] = Entity(mid, "monster", f"{kind} {index + 1}",
                                spot[0], spot[1], hp=hp, max_hp=hp,
                                attack=attack, armour=armour, drop=drop)
@@ -762,4 +930,5 @@ def build(seed: str, players: list, width: int = 11, height: int = 9,
 
     return Room(seed=seed, width=width, height=height,
                 walls=frozenset(walls), entities=entities,
-                shrines=frozenset(shrines))
+                shrines=frozenset(shrines), depth=max(1, depth),
+                limit=BASE_LIGHT + max(0, torches) * TORCH_TICKS)

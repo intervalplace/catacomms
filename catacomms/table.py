@@ -26,8 +26,8 @@ from .engine import Room, state_hash, step
 APP = "catacomms"
 
 # Wire forms, kept short because every player sends one of these every turn.
-#   i|<tick>|<action>     an input
-#   h|<tick>|<hash>       the state after that tick, as the sender computed it
+#   i|<tick>|<action>|<hash>   an input, carrying the hash of the tick before
+#   h|<tick>|<hash>            a hash on its own, for the last tick of a room
 #   j|<name>              joining, before the room is built
 MSG_INPUT = "i"
 MSG_HASH = "h"
@@ -55,20 +55,41 @@ class Table:
         """Record my action for the current tick and queue it for broadcast."""
         if self.room.over or self.has_acted():
             return False
+        if not self.room.entities.get(self.me, None) or \
+                not self.room.entities[self.me].due(self.room.tick):
+            return False        # mid-action; the world is not waiting on you
         self.inputs.setdefault(self.room.tick, {})[self.me] = action
-        self.pending_send.append(f"{MSG_INPUT}|{self.room.tick}|{action}")
+        self.pending_send.append(self._input_frame(self.room.tick, action))
         self._last_input_send = 0.0        # force a fresh send window
         self._last_sent_tick = self.room.tick
         return True
 
+    def _input_frame(self, tick: int, action: str) -> str:
+        """An input, carrying the hash of the tick before it.
+
+        A hash in its own frame doubled the airtime of a turn: 149 ms for the
+        action and 174 ms for the hash, where the two together are 185 ms. At
+        one percent duty every millisecond owes a hundred of silence, so that
+        was the difference between a turn every 32 seconds and one every 18.
+
+        Divergence is still caught, one turn later than before. On a link where
+        anything can arrive late anyway, that costs nothing.
+        """
+        carried = self.hashes.get(tick - 1, {}).get(self.me, "")
+        return f"{MSG_INPUT}|{tick}|{action}" + (f"|{carried}" if carried else "")
+
     def has_acted(self) -> bool:
+        mine = self.room.entities.get(self.me)
+        if mine is not None and not mine.due(self.room.tick):
+            return True         # already committed to something long
         return self.me in self.inputs.get(self.room.tick, {})
 
     def waiting_for(self) -> list:
         """Who has not yet submitted for this tick."""
         have = self.inputs.get(self.room.tick, {})
         return sorted(p for p in self.players
-                      if p not in have and self._alive(p))
+                      if p not in have and self._alive(p)
+                      and self.room.entities[p].due(self.room.tick))
 
     def _alive(self, pid: str) -> bool:
         entity = self.room.entities.get(pid)
@@ -123,13 +144,19 @@ class Table:
         parts = payload.split("|", 2)
         kind = parts[0] if parts else ""
 
-        if kind == MSG_INPUT and len(parts) == 3 and parts[1].lstrip("-").isdigit():
+        if kind == MSG_INPUT and len(parts) >= 3 and parts[1].lstrip("-").isdigit():
             tick = int(parts[1])
+            action, _, carried = parts[2].partition("|")
+            events: list = []
+            if carried:
+                # Their hash of the tick before this one, riding along.
+                self.hashes.setdefault(tick - 1, {})[src] = carried
+                events += self._check(tick - 1)
             # An input for a tick already resolved is a retransmission of
             # something we acted on, so it is dropped rather than replayed.
             if tick >= self.room.tick:
-                self.inputs.setdefault(tick, {}).setdefault(src, parts[2])
-            return self.advance()
+                self.inputs.setdefault(tick, {}).setdefault(src, action)
+            return events + self.advance()
 
         if kind == MSG_HASH and len(parts) == 3 and parts[1].lstrip("-").isdigit():
             tick = int(parts[1])
@@ -144,13 +171,18 @@ class Table:
         while not self.room.over:
             tick = self.room.tick
             have = self.inputs.get(tick, {})
-            if any(p not in have for p in self.players if self._alive(p)):
+            if any(p not in have for p in self.players
+                   if self._alive(p) and self.room.entities[p].due(tick)):
                 break
             self.room, stepped = step(self.room, have)
             events += stepped
             digest = state_hash(self.room)
             self.hashes.setdefault(tick, {})[self.me] = digest
-            self.pending_send.append(f"{MSG_HASH}|{tick}|{digest}")
+            # Normally this rides on the next input. The last tick of a room
+            # has no next input, so that one goes on its own or nobody could
+            # ever tell whether the party agreed about how it ended.
+            if self.room.over:
+                self.pending_send.append(f"{MSG_HASH}|{tick}|{digest}")
             events += self._check(tick)
         return events
 
