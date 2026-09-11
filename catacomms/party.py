@@ -119,15 +119,32 @@ class Party:
             # for an input meant for a room the other never built. The caller
             # whose delve "wins" is simply whoever the others were idle for; the
             # rest can /stay and re-answer, or the caller retries.
-            if self.state != IDLE:
-                if src == self.caller and parts[1] == self.seed:
-                    return []            # a duplicate of the call we already saw
-                return [Event("note", text=(
-                    f"{name_of(src)} is also calling a delve, but you are "
-                    f"already in one. Finish or leave it first."))]
-            self.seed, self.caller, self.state = parts[1], src, INVITED
+            their_seed = parts[1]
+            if self.state == PLAYING:
+                return []                # a game in progress is never interrupted
+            if self.state == INVITED and src == self.caller \
+                    and their_seed == self.seed:
+                return []                # duplicate of the call we already saw
+            if self.state == CALLING:
+                # Two people called at once. Rather than deadlock (each refusing
+                # the other) or corrupt state (each overwriting the other), both
+                # sides deterministically defer to the lower seed. Whoever's
+                # seed loses abandons their own call and becomes invited to the
+                # winner, so both machines converge on one room with no manual
+                # step. Ties (same seed) cannot happen: a seed includes the
+                # caller's address.
+                if their_seed < self.seed:
+                    self.seed, self.caller, self.state = their_seed, src, INVITED
+                    self.accepted = {}
+                    self._start_msg = ""
+                    return [Event("note", text=(
+                        f"{name_of(src)} also called; their room {their_seed} "
+                        f"takes precedence. /join to go, /stay to sit it out."))]
+                return []                # ours wins; they will defer to us
+            # IDLE: a normal invitation.
+            self.seed, self.caller, self.state = their_seed, src, INVITED
             return [Event("note", text=(
-                f"{name_of(src)} is calling a delve into room {parts[1]}. "
+                f"{name_of(src)} is calling a delve into room {their_seed}. "
                 f"/join to go, /stay to sit it out."))]
 
         if kind == ACCEPT and len(parts) >= 2 and self.state == CALLING:
