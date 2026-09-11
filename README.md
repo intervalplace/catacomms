@@ -82,6 +82,15 @@ the grid did not have a reason before.
 
 Two thirds of what drops is still something to swing. A bow is a find.
 
+### Your pack
+
+The sidebar shows what you are carrying, how full you are, your coin, and what
+`d` would set down. Not the party's: each person's pack is their own.
+
+There is nowhere to open, no slots and nothing to select. You pick things up by
+walking over them, you fight with the best of each kind you hold, and `d` sets
+down the one you need least. `/stash` shows what you own between delves.
+
 **`d` sets something down**, and it is the only inventory verb there is. It
 drops the item you need least: anything that is not your best of its kind does
 nothing for you at all, so those go first, cheapest first. One rule, no menu.
@@ -378,6 +387,26 @@ person, so going down alone is a delve rather than a slaughter.
 
 `--tcp-listen` gives the client something to talk through, and a door for
 somebody to arrive by later.
+
+### Sound
+
+Synthesised in the page, so nothing is fetched and there are no files to ship.
+At eighteen seconds a turn you will look away, and the sounds are how you find
+out the world moved without watching it: your move, a hit on you against a hit
+on something else, a death, a find, a shrine, a cut, a tree coming down, and a
+divergence. Ten lines in a table at the top of the page script, one per sound,
+tune them there.
+
+There is also music, in the two places it does not compete with anything. A
+sparse motif plays while a delve has been called and you are waiting on people
+to answer, and stops the moment the room exists. A delve ending gets one of
+three stings: a fanfare for cleared, something unresolved for withdrew, and a
+slow descent for wiped.
+
+Nothing loops under play. The sixty seconds of a chop are when people talk.
+
+Off with one button, and the choice is remembered. Browsers will not start
+audio before a gesture, so the first sound arrives after your first click.
 
 ### In a browser
 
