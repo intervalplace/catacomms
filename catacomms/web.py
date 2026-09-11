@@ -155,6 +155,7 @@ def snapshot(party, session, log, recent=()) -> dict:
         "you": session.address,
         "nick": session.nick,
         "status": party.status(),
+        "state": party.state,          # idle, calling, invited, playing
         "log": [{"text": text, "role": role} for _, text, role in log[-40:]],
         "room": None,
         # Only the last resolved tick's events, and they stay put until the
@@ -197,6 +198,8 @@ def snapshot(party, session, log, recent=()) -> dict:
             "me": eid == party.me,
             "swing": e.swing, "guard": e.guard, "coins": e.coins,
             "doing": e.doing, "until": e.busy_until,
+            "spare": (e.spare().label if e.kind == "player"
+                      and e.spare() is not None else ""),
             "pack": [{"label": i.label, "kind": i.kind, "tier": i.tier}
                      for i in e.pack if i.kind != "coin"],
         })
@@ -248,7 +251,9 @@ button:active{background:var(--rule)}
 #board.can{cursor:pointer}
 </style></head><body>
 <div class="wrap">
-  <div class="bar"><h1><span>&#x2571;&#x2571;&#x2572;</span> catacomms</h1><span id="status"></span></div>
+  <div class="bar"><h1><span>&#x2571;&#x2571;&#x2572;</span> catacomms</h1>
+  <span><button id="mute" type="button" aria-pressed="true">sound on</button>
+  <span id="status"></span></span></div>
   <div class="cols">
     <canvas id="board" width="352" height="288"></canvas>
     <div class="side" id="side"></div>
@@ -266,6 +271,126 @@ button:active{background:var(--rule)}
   <form id="say"><input id="text" placeholder="say something, or /delve" autocomplete="off"><button>send</button></form>
 </div>
 <script>
+/* Sound is synthesised, not fetched: the page stays one file with nothing
+   behind it. It is also information rather than decoration. At eighteen
+   seconds a turn you will look away, and this is how you find out the world
+   moved without watching it.
+
+   Every sound is one line in this table: frequency, where it slides to,
+   duration in seconds, waveform, and volume. Tune it here. */
+const SOUNDS = {
+  yourTurn: [520, 700, 0.09, 'sine',     0.16],
+  hitThem:  [190, 120, 0.10, 'square',   0.13],
+  hitYou:   [110,  70, 0.20, 'sawtooth', 0.26],
+  miss:     [300, 240, 0.05, 'sine',     0.07],
+  death:    [260,  60, 0.38, 'square',   0.18],
+  found:    [660, 990, 0.14, 'triangle', 0.16],
+  mend:     [440, 880, 0.20, 'sine',     0.16],
+  chopped:  [150, 110, 0.07, 'square',   0.18],
+  felled:   [120,  45, 0.55, 'sawtooth', 0.20],
+  diverged: [370, 370, 0.70, 'sawtooth', 0.22],
+};
+
+let audio = null, muted = localStorage.getItem('catacomms-muted') === '1';
+function note(name, delay){
+  if(muted || !SOUNDS[name]) return;
+  // Browsers refuse to start audio before a gesture, so the context is made
+  // on the first one and never before.
+  if(!audio){ try{ audio = new (window.AudioContext||window.webkitAudioContext)(); }
+              catch(e){ return; } }
+  if(audio.state === 'suspended') audio.resume();
+  const [from, to, dur, shape, vol] = SOUNDS[name];
+  const t = audio.currentTime + (delay||0);
+  const osc = audio.createOscillator(), gain = audio.createGain();
+  osc.type = shape;
+  osc.frequency.setValueAtTime(from, t);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(20,to), t + dur);
+  // A hard start or stop clicks, so the envelope opens and closes quickly
+  // rather than instantly.
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(gain); gain.connect(audio.destination);
+  osc.start(t); osc.stop(t + dur + 0.02);
+}
+function setMuted(on){
+  muted = on;
+  if(on) stopLobby();
+  localStorage.setItem('catacomms-muted', on ? '1' : '0');
+  const b = document.getElementById('mute');
+  if(b){ b.textContent = on ? 'sound off' : 'sound on'; b.setAttribute('aria-pressed', String(!on)); }
+}
+
+/* Notes, for the two pieces of music the game has. Nothing loops under play:
+   the sixty seconds of a chop are when people talk, and music would be
+   competing with the only thing meant to be happening. */
+const N = {A3:220.00, C4:261.63, D4:293.66, Eb4:311.13, E4:329.63, F4:349.23,
+           G4:392.00, Ab4:415.30, A4:440.00, Bb4:466.16, B4:493.88, C5:523.25,
+           D5:587.33, E5:659.25, G5:783.99, A5:880.00, C6:1046.50,
+           C3:130.81, F3:174.61, G3:196.00, Ab3:207.65, E3:164.81};
+
+/* [frequency, start, length, waveform, volume] */
+const FANFARE = [
+  // Brass is a sawtooth with a fast attack. Three pickups and a landing, then
+  // up the triad, doubled an octave down for weight.
+  [N.G4, 0.00, 0.10,'sawtooth',0.15], [N.G4, 0.13, 0.10,'sawtooth',0.15],
+  [N.G4, 0.26, 0.10,'sawtooth',0.15], [N.C5, 0.39, 0.26,'sawtooth',0.18],
+  [N.C4, 0.39, 0.26,'sawtooth',0.10],
+  [N.E5, 0.67, 0.13,'sawtooth',0.18], [N.G5, 0.82, 0.55,'sawtooth',0.20],
+  [N.C5, 0.82, 0.55,'sawtooth',0.11], [N.C4, 0.82, 0.60,'triangle',0.09],
+];
+const WITHDREW = [
+  // No resolution. You came back, you did not finish.
+  [N.C5, 0.00, 0.16,'triangle',0.13], [N.A4, 0.18, 0.16,'triangle',0.13],
+  [N.F4, 0.36, 0.44,'triangle',0.14], [N.F3, 0.36, 0.50,'sine',0.09],
+];
+const WIPED = [
+  [N.F4, 0.00, 0.22,'sawtooth',0.13], [N.Eb4,0.24, 0.22,'sawtooth',0.13],
+  [N.C4, 0.48, 0.30,'sawtooth',0.14], [N.Ab3,0.80, 0.85,'sawtooth',0.15],
+  [N.C3, 0.80, 0.90,'sine',0.11],
+];
+/* Called, and waiting on everybody to answer. Sparse on purpose: it plays
+   into dead air and stops the moment the room exists. */
+const LOBBY = [
+  [N.A3, 0.00, 2.20,'sine',    0.055],
+  [N.E4, 0.20, 0.45,'triangle',0.075], [N.A4, 0.75, 0.45,'triangle',0.075],
+  [N.C5, 1.30, 0.60,'triangle',0.070], [N.B4, 2.00, 0.80,'triangle',0.060],
+  [N.E3, 2.60, 2.00,'sine',    0.050], [N.E4, 2.90, 0.45,'triangle',0.065],
+  [N.G4, 3.45, 0.90,'triangle',0.060],
+];
+const LOBBY_BAR = 4.8;
+
+function phrase(notes, when){
+  if(muted) return;
+  if(!audio){ try{ audio = new (window.AudioContext||window.webkitAudioContext)(); }
+              catch(e){ return; } }
+  if(audio.state === 'suspended') audio.resume();
+  const base = audio.currentTime + (when||0.02);
+  notes.forEach(([f, at, len, shape, vol])=>{
+    const t = base + at;
+    const osc = audio.createOscillator(), gain = audio.createGain();
+    osc.type = shape; osc.frequency.setValueAtTime(f, t);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.setValueAtTime(vol, t + len * 0.6);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    osc.connect(gain); gain.connect(audio.destination);
+    osc.start(t); osc.stop(t + len + 0.02);
+  });
+}
+
+let lobbyTimer = null;
+function startLobby(){
+  if(lobbyTimer || muted) return;
+  phrase(LOBBY, 0.05);
+  lobbyTimer = setInterval(()=>{ if(muted) return stopLobby(); phrase(LOBBY, 0.05); },
+                           LOBBY_BAR * 1000);
+}
+function stopLobby(){
+  if(lobbyTimer){ clearInterval(lobbyTimer); lobbyTimer = null; }
+}
+const OUTCOME = {cleared: FANFARE, withdrew: WITHDREW, wiped: WIPED};
+
 const SPR=12, TILE=24;            // 12x12 art drawn at 2x
 /* How dark the unlit parts of the room get, 0 to 1. Atmosphere only: it must
    never hide a monster, because the terminal view has no lighting and two
@@ -558,8 +683,10 @@ function side(){
     h+='<div class="who" style="color:'+c+'">'+e.name+(e.alive?'':' &#x2717;')+'</div>'+bar(e,c);
     if(e.me){h+='<div class="muted">swing '+e.swing+' &middot; guard '+e.guard
       +'<br>'+e.coins+' coin &middot; '+e.pack.length+'/'+r.pack_limit+'</div>';
+      if(!e.pack.length) h+='<div class="muted">pack empty</div>';
       e.pack.forEach(i=>{const adj=i.label.split(' ')[0];
-        h+='<div style="color:'+(HUES[adj]||'#9aa8b0')+'">'+i.label+'</div>';});}
+        h+='<div style="color:'+(HUES[adj]||'#9aa8b0')+'">'+i.label+'</div>';});
+      if(e.spare) h+='<div class="muted">d sets down '+e.spare+'</div>';}
   });
   const mobs=r.entities.filter(e=>e.kind==='monster'&&e.alive);
   if(mobs.length){h+='<div class="muted" style="margin-top:8px">down here</div>';
@@ -628,6 +755,8 @@ board.onclick=ev=>{
   const there=r.entities.find(e=>e.alive&&e.x===c.x&&e.y===c.y);
   act((there&&there.kind==='monster'?'a:':'m:')+dir);
 };
+document.getElementById('mute').onclick=()=>{ setMuted(!muted); if(!muted) note('yourTurn'); };
+setMuted(muted);
 document.getElementById('say').onsubmit=e=>{
   e.preventDefault();
   const box=document.getElementById('text');
@@ -636,18 +765,35 @@ document.getElementById('say').onsubmit=e=>{
 };
 new EventSource('/events').onmessage=m=>{
   const next=JSON.parse(m.data);
+  // Waiting on people to answer: dead air, and the one place music does not
+  // compete with anything. It stops the moment the room exists.
+  if(next.state==='calling'||next.state==='invited') startLobby(); else stopLobby();
+  const wasOver = state.room && state.room.over;
+  if(next.room && next.room.over && !wasOver)
+    phrase(OUTCOME[next.room.outcome] || WITHDREW, 0.15);
   const turned=!state.room||!next.room||next.room.tick!==state.room.tick;
   prev=state; state=next;
   if(turned){
     moveAt=performance.now(); flash={};
     const where={}; (next.room?next.room.entities:[]).forEach(e=>where[e.id]=e);
     swings={};
+    let heard = 0;
     (next.events||[]).forEach(ev=>{
       const at=where[ev.target]||where[ev.actor]; if(!at)return;
       if(ev.kind==='hit'||ev.kind==='miss'){
         const a=where[ev.actor], b=where[ev.target];
         if(a&&b) swings[ev.actor]={dx:Math.sign(b.x-a.x),dy:Math.sign(b.y-a.y),at:performance.now()};
       }
+      const mine = next.room && next.room.entities.find(e=>e.me);
+      const atMe = mine && ev.target === mine.id;
+      if(ev.kind==='hit') note(atMe?'hitYou':'hitThem', 0.02*heard++);
+      if(ev.kind==='miss') note('miss', 0.02*heard++);
+      if(ev.kind==='death') note('death', 0.02*heard++);
+      if(ev.kind==='pickup') note('found', 0.02*heard++);
+      if(ev.kind==='mend'||ev.kind==='shrine') note('mend', 0.02*heard++);
+      if(ev.kind==='chopped') note('chopped', 0.02*heard++);
+      if(ev.kind==='felled') note('felled', 0.02*heard++);
+      if(ev.kind==='diverged') note('diverged');
       if(ev.kind==='hit'){flash[ev.target]=performance.now();
         floats.push({text:'-'+ev.amount,x:at.x,y:at.y,col:'#ff9a9a',at:performance.now()});}
       if(ev.kind==='miss') floats.push({text:'miss',x:at.x,y:at.y,col:'#8fa0a8',at:performance.now()});
@@ -656,6 +802,10 @@ new EventSource('/events').onmessage=m=>{
       if(ev.kind==='death') floats.push({text:'\u2717',x:at.x,y:at.y,col:'#ff6a6a',at:performance.now()});
     });
     setTimeout(()=>{flash={};},320);
+    // Your move, and you were probably not looking.
+    const mine = next.room && next.room.entities.find(e=>e.me);
+    if(next.room && !next.room.over && !next.room.acted && mine && mine.alive)
+      note('yourTurn', 0.05 + 0.02*heard);
   }
   render();
 };

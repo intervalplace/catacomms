@@ -318,19 +318,26 @@ class DelveUI:
                 mark = "" if entity.alive else f" {self.glyphs.dead}"
                 lines.append([(entity.name[:12] + mark, role)])
                 lines.append([("  " + self._bar(entity), "muted")])
-            carried = [i for eid in sorted(party.table.players)
-                       for i in room.entities[eid].pack if i.kind != "coin"]
-            coin = sum(room.entities[e].coins for e in party.table.players)
-            if carried or coin:
+            # Your pack, not the party's. This listed everyone's items
+            # together under one heading, which read as yours and was not,
+            # while the "pack full" line underneath counted only you.
+            mine = room.entities.get(party.me)
+            if mine is not None:
+                goods = [i for i in mine.pack if i.kind != "coin"]
                 lines.append([("", "muted")])
-                lines.append([("\u2500\u2500 carried \u2500\u2500", "rule")])
-                for item in carried[-6:]:
+                lines.append([(f"\u2500\u2500 your pack {mine.carried}/{PACK_LIMIT} "
+                               f"\u2500\u2500", "rule")])
+                for item in goods[-6:]:
                     lines.append([(f"{item.glyph} {item.label[:18]}", "accent")])
-                mine = room.entities.get(party.me)
-                if mine is not None and mine.carried >= PACK_LIMIT:
-                    lines.append([("pack full", "warn")])
-                if coin:
-                    lines.append([(f"$ {coin} coins", "accent")])
+                if not goods:
+                    lines.append([("  empty", "muted")])
+                if mine.carried >= PACK_LIMIT:
+                    lines.append([("  full; d sets one down", "warn")])
+                if mine.coins:
+                    lines.append([(f"$ {mine.coins} coin", "accent")])
+                spare = mine.spare()
+                if spare is not None:
+                    lines.append([(f"d drops {spare.label[:14]}", "muted")])
             loose = sum(len(v) for v in room.floor.values())
             if loose:
                 lines.append([(f"{loose} still on the floor", "warn")])
