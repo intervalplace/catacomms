@@ -119,6 +119,163 @@ distinct named things from two short word lists but only four things they can
 do. Loot is derived from the room seed at build time, so nobody transmits an
 item: every machine already knows what is down there.
 
+## What a delve leaves behind
+
+A room is a pure function of its seed and roster, so anyone can rebuild it and
+confirm that an Ashen Fang is genuinely what drops there. What they cannot
+check alone is that you were the one who walked out with it.
+
+So when a room ends, everyone present builds the same record from the same
+final state and signs it. Only the signature crosses the radio, because the
+record itself is something every machine already computed. Editing what you
+carried out afterwards invalidates every signature on it at once.
+
+Two things fall out of that rather than being decided:
+
+**You cannot witness your own loot.** A delve alone produces a record signed
+only by you, which is worth nothing to anybody else. It happened, nobody
+disputes it, and it mints nothing.
+
+**Being reachable is not being somewhere.** The record notes, per person,
+whether their own transmissions were heard on air. A frame relayed to you over
+a socket proves somebody exists; it does not prove they were near enough to
+hear. A delve played entirely over TCP is witnessed and still mints nothing,
+and in a mixed party the people who were physically there earn while the
+person on a socket does not.
+
+That is the whole point of the game stated as arithmetic. What is scarce is
+not the radio, it is company: the people who were there are what make an item
+real, and being somewhere is what cannot be faked.
+
+`/stash` shows what you can prove you own, and who saw you get it.
+
+## The board
+
+Every node serves its own, live, at `/board` whenever the game is running with
+`--web`. Nothing to export, nothing to keep up to date, and no internet
+required: it is simply what that machine witnessed.
+
+There is no central board and there cannot be. Point a page at several nodes
+and it merges them, because two people who were both there hold the same delve
+with different signatures on it:
+
+```
+http://your-host:8080/board
+https://catacomms.org/board.html?from=http://host-a:8080,http://host-b:8080
+```
+
+### Filling a public page
+
+A page served over https cannot fetch a board from a laptop with no
+certificate: browsers refuse mixed content and nothing configures that away.
+So a public board is pushed rather than pulled.
+
+```
+python -m catacomms --port /dev/ttyUSB0 --band eu868 --nick hank --web \
+    --publish-to yourname/board
+```
+
+After every delve the board is written to that repository. The page then reads
+it from `raw.githubusercontent.com`, which serves CORS headers, so **the
+website itself never changes**: deploy it once and the numbers move on their
+own. It does not matter how the site is hosted, or whether the host knows
+about the repository at all.
+
+```
+https://catacomms.org/board.html?gh=yourname/board
+```
+
+Set `DEFAULT_GH` at the top of the page script to `'yourname/board'` and even
+the query string goes away.
+
+It needs a GitHub token with contents write on that repository and nothing
+else, in `~/.catacomms/github-token` or `CATACOMMS_GITHUB_TOKEN`. The
+repository has to be public, since the page reads it without one.
+
+A failed push says so and is otherwise ignored, because losing a board update
+is not a reason to lose the evening.
+
+`python -m catacomms board > board.json` is still there for taking a snapshot
+by hand.
+
+Nothing on the page is asserted. Your browser recomputes each address from the
+two public keys it was handed, verifies every signature against the exact
+bytes that were signed, and counts only what survives.
+
+An address is the hash of **both** halves of an identity, encryption and
+signing, which is what makes this possible: given the two public keys a
+stranger can recompute the address themselves, so an invented signing key
+cannot be attached to a real name.
+
+Everything the page displays is read out of the signed bytes, never out of the
+readable fields sitting beside them. Those are there for a person to read; a
+signature does not cover them. Displaying them would let anybody publish a
+valid signature next to invented loot, which is exactly what the first version
+did.
+
+## Time, and why the budget used to run out
+
+The European duty cycle is one percent: every millisecond transmitted owes a
+hundred of silence. A turn used to cost 323 ms per player, an action and then a
+state hash, which is one turn every 32 seconds if you want to keep playing. A
+party pressing keys every four seconds burned eight times the allowance and
+jammed after seven minutes.
+
+Three things fixed it.
+
+**The state hash rides on the next action.** 323 ms becomes 185 ms, a 43%
+saving for one field, and one turn every 18 seconds. Divergence is caught a
+turn later than before, which on a link where anything can arrive late costs
+nothing.
+
+**Actions have a length.** A swing is one tick, a chop is sixty. The engine
+stays clockless: a tick is a unit, not a second, and somebody twelve ticks into
+a chop is simply not asked for input. Since airtime is charged per
+transmission and not per second of game time, that makes **fighting expensive
+and working nearly free**.
+
+**Waiting means waiting until something happens.** Without that, one person
+chopping for sixty ticks obliged everybody else to send sixty waits, which is
+sixty frames to watch somebody work. If nothing hostile is about and nobody who
+could act wants to, the world jumps to whenever the next thing happens. Two
+frames now cover a minute of game time instead of sixty.
+
+Sixty ticks for a chop is not a taste decision. A thirty-character line of chat
+costs about what an action costs, and the budget grants ten milliseconds a
+second, so a minute of work is the length at which the work pays for the
+conversation that happens over it.
+
+## The camp
+
+`/camp` goes above ground. Trees, no monsters, the same engine and the same
+turn lock: a camp is a room whose monsters are trees and whose danger is that
+you are not delving. `c` and a direction cuts, `x` when you are done.
+
+A log is a torch, and a torch is light.
+
+## Depth
+
+`/delve 3 2` goes to depth three carrying two torches. Deeper rooms are bigger,
+hold more, and hold worse; the weakest things stop appearing. Measured over 250
+rooms at each setting with three players:
+
+| depth | torches | light | cleared | withdrew | wiped |
+|---|---|---|---|---|---|
+| 1 | 0 | 20 | 61% | 27% | 11% |
+| 1 | 2 | 34 | 68% | 19% | 12% |
+| 3 | 0 | 20 | 24% | 49% | 26% |
+| 3 | 2 | 34 | 35% | 26% | 38% |
+| 4 | 0 | 20 | 20% | 60% | 18% |
+| 4 | 2 | 34 | 33% | 33% | 33% |
+
+Torches earn their place and then stop: the first two convert a third of your
+withdrawals into clears, and a third changes nothing, because by then the fight
+is decided rather than the light. A party learns to bring two.
+
+Depth used to add a monster per step and shift the whole roster upward, which
+made depth four a hundred percent casualties. It adds one every second step
+now, because a party cannot yet carry anything down with them to meet it.
+
 ## Balance, measured
 
 300 rooms played by a simple competent policy:
@@ -207,6 +364,20 @@ from elsewhere. `hjkl` or the arrows move, `HJKL` attack in that direction,
 space waits. `/delve` calls one, `/begin` sets off, `/join` and `/stay` answer
 somebody else's. Anything else you type is said out loud to the party, on the
 same radio, in the same window.
+
+### On your own, with no radio at all
+
+A delve alone needs nobody to talk to, so it needs no radio either:
+
+```
+PYTHONPATH=../loraline python -m catacomms --nick yourname --tcp-listen 4242 --web
+```
+
+Open `localhost:8080`, type `/delve` then `/begin`. Rooms hold one monster per
+person, so going down alone is a delve rather than a slaughter.
+
+`--tcp-listen` gives the client something to talk through, and a door for
+somebody to arrive by later.
 
 ### In a browser
 

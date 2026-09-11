@@ -441,4 +441,294 @@ assert any(e.kind == "held" for e in evs), [e.kind for e in evs]
 assert not any(e.kind == "hit" for e in evs)
 ok("a friend standing in the line stops the shot, so where you stand matters")
 
+
+# ---------- what a delve leaves behind ----------
+import tempfile, os
+from catacomms import records as R
+from loraline.crypto import Identity, Keyring
+
+people = [Identity() for _ in range(3)]
+rosters = {p.address: n for p, n in zip(people, ("hank", "dave", "mira"))}
+rings = {}
+for me in people:
+    kr = Keyring(me, "shared")
+    for other in people:
+        kr.learn(other.address, other.public_b64, other.verify_b64)
+    rings[me.address] = kr
+
+finished = build("record-room", sorted(rosters.items()))
+loot = Item("weapon", "Ashen Fang", "named", 12)
+first = sorted(rosters)[0]
+finished = E.replace(finished, entities={
+    **finished.entities,
+    first: E.replace(finished.entities[first], pack=(loot, Item("coin", "coins", "plain", 30))),
+    **{m: E.replace(finished.entities[m], hp=0) for m in finished.entities
+       if finished.entities[m].kind == "monster"}})
+
+rec = R.build(finished, rosters, {a: True for a in rosters})
+assert rec.outcome == "cleared"
+for me in people:
+    rec.sign(me)
+assert rec.witnesses(rings[first]) == sorted(rosters)
+ok(f"a finished delve makes a record every witness signs ({rec.id})")
+
+# tampering after the fact breaks every signature at once
+tampered = R.Record.from_json(rec.to_json())
+tampered.carried[first][0]["tier"] = "named"
+tampered.carried[first][0]["value"] = 99
+assert tampered.witnesses(rings[first]) == []
+ok("editing what you carried out invalidates every signature on the record")
+
+# a signature from somebody who was not there is refused
+outsider = Identity()
+rings[first].learn(outsider.address, outsider.public_b64, outsider.verify_b64)
+assert not rec.accept(outsider.address, outsider.sign(rec.canonical()), rings[first])
+ok("a signature from somebody not on the roster is refused")
+
+# you cannot witness your own loot
+alone = {people[0].address: "hank"}
+solo_room = build("solo-room", sorted(alone.items()))
+solo_room = E.replace(solo_room, entities={
+    **solo_room.entities,
+    people[0].address: E.replace(solo_room.entities[people[0].address], pack=(loot,)),
+    **{m: E.replace(solo_room.entities[m], hp=0) for m in solo_room.entities
+       if solo_room.entities[m].kind == "monster"}})
+solo = R.build(solo_room, alone, {people[0].address: True})
+solo.sign(people[0])
+assert solo.witnesses(rings[first]) == [people[0].address]
+assert not solo.attested(rings[first], people[0].address)
+ok("a delve alone is signed only by you, and mints nothing")
+
+# and neither does one played entirely over sockets
+socketed = R.build(finished, rosters, {a: False for a in rosters})
+for me in people:
+    socketed.sign(me)
+assert socketed.witnesses(rings[first]) == sorted(rosters)
+assert not socketed.attested(rings[first], first)
+ok("a delve nobody was heard on air for is witnessed, and still mints nothing")
+
+# a mixed party: those who were on air earn, the one on a socket does not
+third = sorted(rosters)[2]
+mixed = R.build(finished, rosters, {a: (a != third) for a in rosters})
+for me in people:
+    mixed.sign(me)
+assert mixed.attested(rings[first], first)
+assert not mixed.attested(rings[first], third)
+ok("in a mixed party, being somewhere is what earns, per person")
+
+# the stash is what survives all of that
+with tempfile.TemporaryDirectory() as tmp:
+    R.save(rec, tmp); R.save(solo, tmp); R.save(socketed, tmp)
+    held = R.stash(first, rings[first], tmp)
+    assert [i["name"] for i, _ in held] == ["Ashen Fang"], held
+    assert R.purse(first, rings[first], tmp) == 30
+    assert R.stash(people[0].address, rings[people[0].address], tmp) == [] \
+        or people[0].address == first
+ok("the stash counts only what somebody else was there to see")
+
+
+# ---------- a whole delve, signed by everyone who was there ----------
+with tempfile.TemporaryDirectory() as tmp:
+    ids = {p.address: p for p in people}
+    names2 = {p.address: n for p, n in zip(people, ("hank", "dave", "mira"))}
+    parties = {}
+    for p in people:
+        party = Party(p.address, names2[p.address])
+        party.identity, party.keyring, party.store = p, rings[p.address], tmp
+        party.on_air = lambda a: True          # pretend everyone was heard
+        parties[p.address] = party
+
+    def hand_round():
+        out = []
+        for src, party in list(parties.items()):
+            for payload in party.drain():
+                for dst, other in parties.items():
+                    if dst != src:
+                        out += other.on_payload(src, payload, lambda a: names2.get(a, a))
+        return out
+
+    caller = sorted(parties)[0]
+    hand_round()
+    parties[caller].call("evening", names2[caller]); hand_round()
+    for a, party in parties.items():
+        if a != caller:
+            party.accept()
+    hand_round()
+    parties[caller].begin(); hand_round()
+
+    import itertools
+    picks = {a: itertools.cycle(["a:n", "a:e", "m:e", "a:s", "m:s", "a:w", "w"])
+             for a in parties}
+    for _ in range(400):
+        for a, party in parties.items():
+            t = party.table
+            if t and not t.room.over and not t.has_acted() and t._alive(a):
+                party.submit(next(picks[a]))
+        for party in parties.values():
+            party.tick()
+        hand_round()
+        if all(p.table and p.table.room.over for p in parties.values()):
+            break
+    hand_round(); hand_round()
+
+    made = {a: p.record for a, p in parties.items()}
+    assert all(r is not None for r in made.values()), "every machine writes one"
+    assert len({r.id for r in made.values()}) == 1, "and they agree on what happened"
+    signed = made[caller].witnesses(rings[caller])
+    assert signed == sorted(names2), signed
+    ok(f"a played-out delve is recorded identically by all three and signed by all three")
+
+    on_disk = R.load_all(tmp)
+    assert any(r.id == made[caller].id for r in on_disk)
+    ok(f"and it is on disk afterwards ({len(on_disk)} record(s) kept)")
+
+
+# ---------- a signature arriving before you have closed out ----------
+with tempfile.TemporaryDirectory() as tmp2:
+    early_party = Party(people[1].address, "dave")
+    early_party.identity, early_party.keyring, early_party.store = \
+        people[1], rings[people[1].address], tmp2
+    early_party.on_air = lambda a: True
+    early_party.roster = dict(names2)
+    early_party.state = "playing"
+    ended = E.replace(finished, seed="early-room")
+    from catacomms.table import Table
+    early_party.table = Table(ended, people[1].address, dict(names2))
+
+    ahead = R.build(ended, names2, {a: True for a in names2})
+    theirs = ahead.sign(people[0])
+    # their signature turns up first
+    early_party.on_payload(people[0].address, f"g|{ahead.id}|{theirs}",
+                           lambda a: names2.get(a, a))
+    assert early_party.record is None and early_party.early
+    early_party.close_out()
+    assert early_party.record is not None
+    assert people[0].address in early_party.record.witnesses(rings[people[1].address])
+ok("a signature that lands before you have finished is kept, not lost")
+
+
+# ---------- application frames are never retransmitted by loraline ----------
+# so a dropped input must not be able to freeze a tick for ever
+with tempfile.TemporaryDirectory() as tmp3:
+    two = {people[0].address: "hank", people[1].address: "dave"}
+    lossy = {}
+    for p in people[:2]:
+        party = Party(p.address, two[p.address])
+        party.identity, party.keyring, party.store = p, rings[p.address], tmp3
+        party.on_air = lambda a: True
+        lossy[p.address] = party
+
+    dropped = {"n": 0}
+    def hand_round_lossy(drop_every=0):
+        for src, party in list(lossy.items()):
+            for payload in party.drain():
+                dropped["n"] += 1
+                if drop_every and dropped["n"] % drop_every == 0:
+                    continue                      # lost on the air
+                for dst, other in lossy.items():
+                    if dst != src:
+                        other.on_payload(src, payload, lambda a: two.get(a, a))
+
+    first2 = sorted(lossy)[0]
+    hand_round_lossy()
+    lossy[first2].call("lossy", two[first2]); hand_round_lossy()
+    for a, party in lossy.items():
+        if a != first2:
+            party.accept()
+    hand_round_lossy()
+    lossy[first2].begin(); hand_round_lossy()
+    assert all(p.table for p in lossy.values()), "the handshake itself must survive"
+
+    clock = [0.0]
+    for _ in range(600):
+        clock[0] += 2.0
+        for a, party in lossy.items():
+            t = party.table
+            if t and not t.room.over and not t.has_acted() and t._alive(a):
+                party.submit("a:e")
+        for party in lossy.values():
+            party.tick()
+            party.resend(clock[0])
+        hand_round_lossy(drop_every=3)
+        if all(p.table.room.over for p in lossy.values()):
+            break
+
+    assert all(p.table.room.over for p in lossy.values()), \
+        "a dropped input must not freeze a tick for ever"
+    assert len({state_hash(p.table.room) for p in lossy.values()}) == 1
+ok(f"a delve finishes over a link dropping 1 frame in 3, because inputs are resent")
+
+
+# ---------- actions take time ----------
+from catacomms.engine import build_camp, ACTION_UNITS, BASE_LIGHT, TORCH_TICKS
+
+camp = build_camp("grove", PLAYERS)
+assert camp.kind == "camp"
+assert not camp.living("monster")
+assert [e for e in camp.entities.values() if e.kind == "tree"]
+ok(f"a camp has trees and nothing that bites "
+   f"({len([e for e in camp.entities.values() if e.kind=='tree'])} of them)")
+
+# walk somebody next to a tree, then cut
+cutter = sorted(p for p, _ in PLAYERS)[0]
+def beside_tree(room, pid):
+    me = room.entities[pid]
+    for d, (dx, dy) in E.DIRECTIONS.items():
+        t = room.at(me.x + dx, me.y + dy)
+        if t is not None and t.kind == "tree":
+            return d
+    return None
+
+# Put the cutter beside a tree rather than pathing there; this is a test about
+# chopping, and walking is already covered elsewhere.
+tree = next(e for e in camp.entities.values() if e.kind == "tree")
+spot = next(((tree.x + dx, tree.y + dy, d) for d, (dx, dy) in E.DIRECTIONS.items()
+             if camp.passable(tree.x + dx, tree.y + dy)
+             and camp.at(tree.x + dx, tree.y + dy) is None), None)
+assert spot, "expected an open square beside a tree"
+sx, sy, from_dir = spot
+way = {"n": "s", "s": "n", "e": "w", "w": "e"}[from_dir]
+walked = E.replace(camp, entities={
+    **camp.entities,
+    cutter: E.replace(camp.entities[cutter], x=sx, y=sy)})
+assert beside_tree(walked, cutter) == way
+
+started = walked.tick
+chopping, evs = step(walked, {cutter: f"c:{way}",
+                              **{p: "w" for p, _ in PLAYERS if p != cutter}})
+worker = chopping.entities[cutter]
+assert any(e.kind == "working" for e in evs)
+assert worker.doing.startswith("chop") and not worker.due(started)
+ok(f"a chop takes {ACTION_UNITS['chop']} ticks and the world stops waiting on you")
+
+# everybody else waiting means the world jumps rather than grinding a tick at a time
+assert chopping.tick > started + 1, chopping.tick
+ok(f"with everyone else idle the world jumps {chopping.tick - started} ticks "
+   f"on one frame each, instead of {ACTION_UNITS['chop']} frames apiece")
+
+done, evs = step(chopping, {p: "w" for p, _ in PLAYERS if p != cutter})
+assert any(e.kind == "chopped" for e in evs), [e.kind for e in evs]
+assert any(i.kind == "wood" for i in done.entities[cutter].pack)
+ok("and at the end of it there is a log in your pack")
+
+# a chop with nothing to cut is refused rather than silently eaten
+nothing, evs = step(walked, {cutter: "c:" + ("n" if way != "n" else "s")})
+assert any(e.kind == "blocked" for e in evs) or not nothing.entities[cutter].doing
+ok("chopping thin air is refused")
+
+# ---------- depth and light ----------
+shallow, deep = build("x", PLAYERS, depth=1), build("x", PLAYERS, depth=4)
+assert len(deep.living("monster")) > len(shallow.living("monster"))
+assert deep.width > shallow.width
+assert state_hash(shallow) != state_hash(deep)
+ok(f"depth four is bigger and busier than depth one "
+   f"({shallow.width}x{shallow.height} and {len(shallow.living('monster'))} "
+   f"against {deep.width}x{deep.height} and {len(deep.living('monster'))})")
+
+dark, lit = build("y", PLAYERS, torches=0), build("y", PLAYERS, torches=3)
+assert dark.limit == BASE_LIGHT and lit.limit == BASE_LIGHT + 3 * TORCH_TICKS
+assert state_hash(dark) != state_hash(lit)
+ok(f"torches are light: {dark.limit} turns bare, {lit.limit} carrying three, "
+   f"and the count is inside the hash")
+
 print("\nALL PASS")
