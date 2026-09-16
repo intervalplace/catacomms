@@ -597,8 +597,15 @@ with tempfile.TemporaryDirectory() as tmp2:
 
     ahead = R.build(ended, names2, {a: True for a in names2})
     theirs = ahead.sign(people[0])
-    # their signature turns up first
-    early_party.on_payload(people[0].address, f"g|{ahead.id}|{theirs}",
+    # their signature turns up first, in the two frames it now travels in
+    from catacomms.party import HALF
+    early_party.on_payload(people[0].address,
+                           f"g|{ahead.id}|a|{theirs[:HALF]}",
+                           lambda a: names2.get(a, a))
+    assert early_party.record is None and not early_party.early, \
+        "one half is not a signature"
+    early_party.on_payload(people[0].address,
+                           f"g|{ahead.id}|b|{theirs[HALF:]}",
                            lambda a: names2.get(a, a))
     assert early_party.record is None and early_party.early
     early_party.close_out()
@@ -730,5 +737,66 @@ assert dark.limit == BASE_LIGHT and lit.limit == BASE_LIGHT + 3 * TORCH_TICKS
 assert state_hash(dark) != state_hash(lit)
 ok(f"torches are light: {dark.limit} turns bare, {lit.limit} carrying three, "
    f"and the count is inside the hash")
+
+
+# ---------- regressions ----------
+# Two bugs that the suite above could not see, kept here so they cannot come
+# back quietly.
+
+from loraline import protocol as proto
+from loraline.crypto import GROUP
+from catacomms.party import HALF, SIGN
+
+# 1. A keyring learns peers from their hello frames and never itself, because
+#    session.py drops any frame from your own address first. So verify() said
+#    no to your own signature, attested() required you among the witnesses,
+#    and every delve minted nothing for the person who walked out of it. The
+#    old fixture hid it by teaching each keyring about every identity
+#    including its own, which the runtime never does.
+from loraline.crypto import Identity, Keyring
+me, you = Identity(), Identity()
+mine = Keyring(me, "pp")
+mine.learn(you.address, you.public_b64, you.verify_b64)   # peers only
+blade = {"kind": "weapon", "name": "a notched blade", "tier": "fine", "value": 12}
+
+
+def _record():
+    return R.Record(seed="s", roster={me.address: "me", you.address: "you"},
+                    tick=20, outcome="cleared", state_hash="abcd1234",
+                    carried={me.address: [blade]},
+                    on_air={me.address: True, you.address: True})
+
+
+rec = _record()
+rec.sign(me)
+assert rec.accept(you.address, _record().sign(you), mine)
+assert len(rec.witnesses(mine)) == 2, rec.witnesses(mine)
+assert rec.attested(mine, me.address), "your own loot is worth something"
+ok("a keyring that has never been told about itself still counts your own delve")
+
+stranger = Identity()
+assert not rec.accept(stranger.address, stranger.sign(rec.canonical()), mine)
+assert not R.verified(you.address, rec.canonical(), "A" * 88, mine, rec.keys)
+ok("and a forged signature is still refused, by keyring or by stored keys")
+
+# 2. The signature frame was 107 characters of payload, sealing to 227 bytes
+#    against a documented limit of 200. can_send weighs airtime and never
+#    length, so nothing anywhere said so.
+_id = Identity()
+_ring = Keyring(_id, "pp")
+for _part, _n in (("a", 0), ("b", HALF)):
+    _pay = f"{SIGN}|{'a' * 16}|{_part}|{_id.sign(b'x')[_n:_n + HALF]}"
+    _sealed = proto.seal(proto.data(_id.address, GROUP, "catacomms", _pay),
+                         _ring, GROUP)
+    assert _sealed.size <= proto.MAX_FRAME_BYTES, _sealed.size
+ok(f"a signature crosses in two frames, both inside the {proto.MAX_FRAME_BYTES} "
+   f"bytes the protocol documents")
+
+import inspect
+
+from catacomms.panel import DelvePanel
+assert len(inspect.signature(DelvePanel.page).parameters) >= 2, \
+    "app.py calls panel.page(route) and catches the TypeError silently"
+ok("the page takes the route the host passes it")
 
 print("\nALL PASS")
