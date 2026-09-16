@@ -144,5 +144,9 @@ class DelvePanel(Panel):
                          [(0.0, t, r) for t, r in self.log], self.recent)
         return state
 
-    def page(self) -> str:
+    def page(self, path: str = "") -> str:
+        # The host calls this with the route that was asked for. Taking no
+        # argument raised a TypeError that `app.py` catches and turns into the
+        # chat page, so /catacomms quietly served the chat instead of the
+        # table, with nothing anywhere to say why.
         return PAGE
