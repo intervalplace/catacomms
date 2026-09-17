@@ -21,7 +21,6 @@ Nothing here talks to a network or a disk except through `save` and `load`.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -30,48 +29,6 @@ from pathlib import Path
 
 DEFAULT_DIR = Path.home() / ".catacomms" / "records"
 VERSION = 1
-
-
-def verified(address: str, message: bytes, signature: str,
-             keyring=None, keys: dict | None = None) -> bool:
-    """Did this address sign these bytes?
-
-    A keyring is asked first and is not relied on, for two reasons.
-
-    The one that bites: **a loraline keyring cannot verify its own
-    signature.** `learn` is only ever called on peers, from their hello
-    frames, and `session.py` drops any frame whose source is your own address
-    before `_on_hello` can see it, so your own verify key never reaches
-    `verifiers`. `attested` requires the holder to be among the witnesses, and
-    the holder never was. Every delve minted nothing for the person who walked
-    out of it: `stash` and `purse` came back empty on a real node however many
-    people had signed. The tests did not catch it because the fixture teaches
-    each keyring about every identity including its own, which is the one
-    thing the runtime never does.
-
-    The other: a record read off somebody's board should be checkable by
-    somebody who has never met anyone on it. Both public halves travel with
-    the record and an address is the hash of that pair, so the arithmetic is
-    self-contained. That is what the board page already does in a browser,
-    done here too so a node and a stranger reach the same answer.
-    """
-    if keyring is not None and keyring.verify(address, message, signature):
-        return True
-    pair = (keys or {}).get(address)
-    if not pair or len(pair) != 2:
-        return False
-    try:
-        from nacl.signing import VerifyKey
-
-        from loraline.crypto import address_of
-        public = base64.b64decode(pair[0], validate=True)
-        verify = base64.b64decode(pair[1], validate=True)
-        if address_of(public, verify) != address:
-            return False        # a key pair that is not this person's
-        VerifyKey(verify).verify(message, base64.b64decode(signature, validate=True))
-        return True
-    except Exception:
-        return False
 
 
 @dataclass
@@ -148,7 +105,7 @@ class Record:
         """Everyone whose signature checks out. Recomputed rather than
         trusted, because a stored record is a file anybody could edit."""
         return sorted(a for a, s in self.signatures.items()
-                      if verified(a, self.canonical(), s, keyring, self.keys))
+                      if keyring.verify(a, self.canonical(), s))
 
     def attested(self, keyring, holder: str) -> bool:
         """Is what this person carried out worth anything to anyone else?

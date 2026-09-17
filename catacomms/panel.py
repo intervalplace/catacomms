@@ -145,8 +145,7 @@ class DelvePanel(Panel):
         return state
 
     def page(self, path: str = "") -> str:
-        # The host calls this with the route that was asked for. Taking no
-        # argument raised a TypeError that `app.py` catches and turns into the
-        # chat page, so /catacomms quietly served the chat instead of the
-        # table, with nothing anywhere to say why.
+        """The dungeon. The path is taken and ignored: loraline passes the
+        route it matched, and a panel that would not accept it raised a
+        TypeError the host swallowed, serving the chat page instead."""
         return PAGE

@@ -764,7 +764,13 @@ document.getElementById('say').onsubmit=e=>{
   box.value=''; box.blur();
 };
 new EventSource('/events').onmessage=m=>{
-  const next=JSON.parse(m.data);
+  /* Standalone, the node publishes its own snapshot and this is the whole of
+     it. Hosted by loraline every panel's snapshot is nested under its tag, and
+     reading the outer object gave undefined for the room, the log and the
+     state, so the dungeon drew nothing and /delve looked like it did nothing
+     at all. */
+  const all=JSON.parse(m.data);
+  const next=all.catacomms||all;
   // Waiting on people to answer: dead air, and the one place music does not
   // compete with anything. It stops the moment the room exists.
   if(next.state==='calling'||next.state==='invited') startLobby(); else stopLobby();

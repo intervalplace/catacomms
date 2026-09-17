@@ -30,19 +30,7 @@ CALL = "v"
 ACCEPT = "y"
 DECLINE = "n"
 START = "s"
-SIGN = "g"        # g|<record id>|<part>|<half of the signature>
-
-#: A signature is 88 base64 characters and the record id is 16, which came to
-#: 107 characters of payload and sealed to 227 bytes against the 200 that
-#: `protocol.MAX_FRAME_BYTES` documents. Nothing caught it: `Link.can_send`
-#: weighs airtime and never length. It is the one frame catacomms sends that
-#: is over, and it is the one carrying the loot.
-#:
-#: So it goes in two halves with a part marker, which seals to about 160 bytes
-#: each. Losing one costs a delay rather than the signature, because the whole
-#: thing is announced again on the next call and accepting it twice changes
-#: nothing.
-HALF = 44
+SIGN = "g"        # g|<record id>|<signature>
 
 IDLE, CALLING, INVITED, PLAYING = "idle", "calling", "invited", "playing"
 
@@ -87,8 +75,6 @@ class Party:
     # because rooms end on whichever move lands last. Held rather than dropped,
     # or whoever finishes last would lose their witnesses.
     early: dict = field(default_factory=dict)
-    #: Halves of a signature waiting for their other half.
-    halves: dict = field(default_factory=dict)
 
     # -- calling one ------------------------------------------------------
 
@@ -191,22 +177,12 @@ class Party:
             return [Event("note", text=f"{name_of(src)} stayed behind.")]
 
         if kind == SIGN and len(parts) == 3:
-            # The dispatcher above splits twice and no more, because a START
-            # carries a roster that contains separators of its own. So the
-            # part marker and the half are still joined here, and are taken
-            # apart on their own.
-            part, _, text = parts[2].partition("|")
-            if part not in ("a", "b") or not text:
-                return []
-            whole = self._half(src, parts[1], part, text)
-            if whole is None:
-                return []
             if self.record is None:
-                self.early[src] = (parts[1], whole)
+                self.early[src] = (parts[1], parts[2])
                 return []
             if parts[1] != self.record.id:
                 return []
-            if not self.record.accept(src, whole, self.keyring):
+            if not self.record.accept(src, parts[2], self.keyring):
                 return [Event("note", text=(
                     f"{name_of(src)} sent a signature that does not check out. "
                     f"Nothing of theirs is being counted."))]
@@ -240,21 +216,6 @@ class Party:
             # on your own clock, so the record has to be closed out here too.
             return self.table.on_payload(src, payload) + self.close_out()
         return []
-
-    def _half(self, src: str, record_id: str, part: str, text: str):
-        """Put a signature back together from its two frames.
-
-        Returns the whole thing once both halves are in, and None until then.
-        A half for a record nobody is holding any more is simply overwritten
-        the next time round, because the announcement repeats.
-        """
-        slot = self.halves.setdefault((src, record_id), {})
-        slot[part] = text
-        if "a" in slot and "b" in slot:
-            whole = slot["a"] + slot["b"]
-            del self.halves[(src, record_id)]
-            return whole
-        return None
 
     def _start(self, seed: str, roster: dict, kind: str = "delve",
                depth: int = 1, torches: int = 0) -> list:
@@ -310,9 +271,7 @@ class Party:
         air[self.me] = True          # you were certainly where you were
         self.record = R.build(self.table.room, self.roster, air)
         signature = self.record.sign(self.identity)
-        for part, n in (("a", 0), ("b", HALF)):
-            self.pending_send.append(
-                f"{SIGN}|{self.record.id}|{part}|{signature[n:n + HALF]}")
+        self.pending_send.append(f"{SIGN}|{self.record.id}|{signature}")
 
         events: list = []
         for who, (record_id, sig) in list(self.early.items()):
@@ -367,7 +326,6 @@ class Party:
         self.roster, self.accepted = {}, {}
         self.kind, self.depth, self.torches = "delve", 1, 0
         self.early.clear()
-        self.halves.clear()
         return [Event("note", text="You are out of the delve.")]
 
     def drain(self) -> list:
