@@ -37,7 +37,7 @@ def read_token(explicit: str = "") -> str:
     if from_env:
         return from_env
     if TOKEN_PATH.exists():
-        return TOKEN_PATH.read_text().strip()
+        return TOKEN_PATH.read_text(encoding="utf-8").strip()
     return ""
 
 

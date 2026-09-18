@@ -164,7 +164,7 @@ def save(record: Record, directory=DEFAULT_DIR) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{record.id}.json"
-    path.write_text(record.to_json())
+    path.write_text(record.to_json(), encoding="utf-8")
     return path
 
 
@@ -175,7 +175,7 @@ def load_all(directory=DEFAULT_DIR) -> list:
     out = []
     for path in sorted(directory.glob("*.json")):
         try:
-            out.append(Record.from_json(path.read_text()))
+            out.append(Record.from_json(path.read_text(encoding="utf-8")))
         except Exception:
             continue        # a corrupt file is not a reason to lose the rest
     return out
