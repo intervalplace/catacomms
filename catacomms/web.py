@@ -85,6 +85,21 @@ class WebView:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = self.rfile.read(length).decode("utf-8", "replace")
+                # The page speaks the same shape whether catacomms is running
+                # on its own or riding in loraline: an order as JSON. Sending
+                # a bare command worked standalone and was silently dropped by
+                # the host, which expects JSON and throws the rest away.
+                try:
+                    order = json.loads(payload)
+                    what = order.get("do")
+                    if what == "act":
+                        payload = order.get("action", "w")
+                    elif what == "say":
+                        payload = "say " + (order.get("text") or "")
+                    else:
+                        payload = str(what or "")
+                except Exception:
+                    pass
                 view.inbox.put(payload.strip())
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
@@ -702,9 +717,15 @@ function log(){
 function render(){draw();side();log();
   document.getElementById('status').textContent=state.status||'';}
 
-const send=b=>fetch('/action',{method:'POST',body:b});
+/* One shape for both: riding in loraline the host reads JSON and drops
+   anything else without a word, which is why typing /delve did nothing. */
+const send=o=>fetch('/',{method:'POST',
+  body:JSON.stringify(Object.assign({panel:'catacomms'},o))});
+const talk=t=>send({do:'say',text:t});
 const syncAtk=()=>{const b=document.getElementById('atkbtn'); if(b)b.classList.toggle('on',attackMode);};
-const act=a=>{attackMode=false;syncAtk();send(a);draw();};
+/* Every action leaves attack mode, which is how it has always worked: you
+   arm a strike, you take it, you are walking again. */
+const act=a=>{attackMode=false;syncAtk();send({do:'act',action:a});draw();};
 
 addEventListener('keydown',e=>{
   if(document.activeElement.tagName==='INPUT')return;
@@ -760,7 +781,7 @@ setMuted(muted);
 document.getElementById('say').onsubmit=e=>{
   e.preventDefault();
   const box=document.getElementById('text');
-  if(box.value.trim())send('say '+box.value.trim());
+  if(box.value.trim())talk(box.value.trim());
   box.value=''; box.blur();
 };
 new EventSource('/events').onmessage=m=>{
