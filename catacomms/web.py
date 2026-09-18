@@ -240,9 +240,24 @@ h1 span{color:var(--mark)}
      font-size:12px;gap:10px}
 canvas{width:100%;height:auto;display:block;image-rendering:pixelated;
        background:var(--panel);border-radius:6px;touch-action:manipulation}
+/* The board is a flex item with width:100%, which took the whole row and
+   pushed the side column off the right edge of the window. The pack lives in
+   that column, so there was no way to see what you were carrying. */
 .cols{display:flex;gap:10px;align-items:flex-start}
-.side{width:150px;flex:none;font-size:12px;line-height:1.5}
+#board{flex:1 1 0;min-width:0}
+.side{order:2}
+/* On a narrow window the column goes underneath rather than off the side. */
+@media(max-width:560px){
+  .cols{flex-direction:column}
+  .side{width:auto;order:2}
+}
+.side{width:150px;flex:0 0 150px;font-size:12px;line-height:1.5}
 .side .who{margin-top:6px}
+/* The pack sits in a narrow column and a line appearing in it is easy to
+   miss, so it lights for a moment when something goes in. */
+.side .lit{color:#e8c46a}
+.side .item.spare{cursor:pointer}
+.side .item.spare:hover{text-decoration:underline}
 .hp{height:5px;background:var(--rule);border-radius:3px;overflow:hidden;margin:2px 0 4px}
 .hp i{display:block;height:100%}
 #log{flex:1;overflow-y:auto;max-height:30vh;font-size:12px;line-height:1.55;
@@ -267,7 +282,8 @@ button:active{background:var(--rule)}
 </style></head><body>
 <div class="wrap">
   <div class="bar"><h1><span>&#x2571;&#x2571;&#x2572;</span> catacomms</h1>
-  <span><button id="mute" type="button" aria-pressed="true">sound on</button>
+  <span><button id="call" type="button">call a delve</button>
+  <button id="mute" type="button" aria-pressed="true">sound on</button>
   <span id="status"></span></span></div>
   <div class="cols">
     <canvas id="board" width="352" height="288"></canvas>
@@ -457,6 +473,7 @@ function itemArt(name, kind){
 
 const board=document.getElementById('board'), ctx=board.getContext('2d');
 let state={}, prev={}, attackMode=false, moveAt=0, floats=[], flash={}, swings={};
+let packLit = 0;          // when something last went into the pack
 let hover=null;   // {x,y} cell the mouse is over, or null
 
 /* Sprites are baked once into offscreen canvases. Drawing 144 rectangles per
@@ -543,6 +560,7 @@ function masonry(r,isWall){
 }
 
 function draw(){
+  callButton();
   const r=state.room;
   if(!r){ctx.clearRect(0,0,board.width,board.height);return;}
   const w=r.w*TILE, h=r.h*TILE;
@@ -696,11 +714,19 @@ function side(){
   r.entities.filter(e=>e.kind==='player').forEach(e=>{
     const c=SEAT[e.seat%SEAT.length];
     h+='<div class="who" style="color:'+c+'">'+e.name+(e.alive?'':' &#x2717;')+'</div>'+bar(e,c);
-    if(e.me){h+='<div class="muted">swing '+e.swing+' &middot; guard '+e.guard
+    if(e.me){const fresh = performance.now() - packLit < 1400;
+      h+='<div class="muted'+(fresh?' lit':'')+'">swing '+e.swing+' &middot; guard '+e.guard
       +'<br>'+e.coins+' coin &middot; '+e.pack.length+'/'+r.pack_limit+'</div>';
       if(!e.pack.length) h+='<div class="muted">pack empty</div>';
       e.pack.forEach(i=>{const adj=i.label.split(' ')[0];
-        h+='<div style="color:'+(HUES[adj]||'#9aa8b0')+'">'+i.label+'</div>';});
+        // The one d would part with is clickable, which is the same action by
+        // another route rather than a menu: choosing an item would have to go
+        // on the wire, and every machine would have to agree what it meant.
+        const going = e.spare && i.label === e.spare;
+        h+='<div class="item'+(going?' spare':'')+'"'
+          +(going?' data-drop="1" title="click to set this down"':'')
+          +' style="color:'+(HUES[adj]||'#9aa8b0')+'">'+i.label
+          +(going?' <span class="muted">set down</span>':'')+'</div>';});
       if(e.spare) h+='<div class="muted">d sets down '+e.spare+'</div>';}
   });
   const mobs=r.entities.filter(e=>e.kind==='monster'&&e.alive);
@@ -715,6 +741,10 @@ function log(){
   el.scrollTop=el.scrollHeight;
 }
 function render(){draw();side();log();
+  // Rebuilt every snapshot, so the handler goes on after drawing rather than
+  // once at the start.
+  const going = document.querySelector('.side .item[data-drop]');
+  if(going) going.onclick = () => act('d');
   document.getElementById('status').textContent=state.status||'';}
 
 /* One shape for both: riding in loraline the host reads JSON and drops
@@ -726,6 +756,30 @@ const syncAtk=()=>{const b=document.getElementById('atkbtn'); if(b)b.classList.t
 /* Every action leaves attack mode, which is how it has always worked: you
    arm a strike, you take it, you are walking again. */
 const act=a=>{attackMode=false;syncAtk();send({do:'act',action:a});draw();};
+
+/* Starting a game should not depend on remembering a slash command. The
+   button says what it would do next, and does it. */
+function callButton(){
+  const b = document.getElementById('call');
+  if(!b) return;
+  const where = state.state;
+  const done = state.room && state.room.over;
+  b.hidden = false;
+  // A finished room stays on screen so you can see how it ended. The way out
+  // of it should not be a slash command nobody was told about.
+  if(done) b.textContent = 'done';
+  else if(where === 'calling') b.textContent = 'set off';
+  else if(where === 'invited') b.textContent = 'join them';
+  else if(!where || where === 'idle') b.textContent = 'call a delve';
+  else b.hidden = true;
+}
+document.getElementById('call').onclick = () => {
+  const where = state.state;
+  if(state.room && state.room.over) talk('/leave');
+  else if(where === 'calling') talk('/begin');
+  else if(where === 'invited') talk('/join');
+  else talk('/delve');
+};
 
 addEventListener('keydown',e=>{
   if(document.activeElement.tagName==='INPUT')return;
@@ -827,6 +881,17 @@ new EventSource('/events').onmessage=m=>{
       if(ev.kind==='mend'||ev.kind==='shrine')
         floats.push({text:'+'+ev.amount,x:at.x,y:at.y,col:'#8fe0b0',at:performance.now()});
       if(ev.kind==='death') floats.push({text:'\u2717',x:at.x,y:at.y,col:'#ff6a6a',at:performance.now()});
+      // Picking something up made a sound and drew nothing, so the only way
+      // to know you had it was to leave and read back through the log.
+      if(ev.kind==='pickup'){
+        floats.push({text:'+ '+ev.target,x:at.x,y:at.y,col:'#e8c46a',
+                     at:performance.now()});
+        packLit = performance.now();
+      }
+      // And a pack too full to take it is worth more than silence.
+      if(ev.kind==='full')
+        floats.push({text:'pack full',x:at.x,y:at.y,col:'#d08a5a',
+                     at:performance.now()});
     });
     setTimeout(()=>{flash={};},320);
     // Your move, and you were probably not looking.

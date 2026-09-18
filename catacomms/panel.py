@@ -55,6 +55,11 @@ class DelvePanel(Panel):
                     "accent" if event.kind in ("end", "mend", "pickup",
                                                "shrine", "dropped") else "muted")
             self.note(event.text, role)
+            # The room stays on screen so you can see how it ended, and then
+            # somebody has to say how to get out of it.
+            if event.kind == "end":
+                self.note("That is the end of it. Press done, or type /leave, "
+                          "to call another.", "accent")
 
     def name_of(self, address: str) -> str:
         peer = self.host.client.session.peers.get(address)

@@ -345,4 +345,17 @@ class Party:
             return f"calling room {self.seed}, {coming} coming, /begin to go"
         if self.state == INVITED:
             return f"invited to room {self.seed}, /join or /stay"
+        # A room that is over stays on screen so you can see how it went, but
+        # it has to say so. It used to keep reporting the summary as though
+        # the delve were still running, with nothing offering a way out, so
+        # dying left the board sitting there and no second game.
+        if self.table is not None and self.table.room.over:
+            return {
+                "cleared": "the room is clear \u00b7 done to finish",
+                "wiped": "the party has fallen \u00b7 done to finish",
+                "withdrew": "the torches burned low \u00b7 done to finish",
+            }.get(self.table.room.outcome, "over \u00b7 done to finish")
         return self.table.summary() if self.table else "playing"
+
+    def over(self) -> bool:
+        return self.table is not None and self.table.room.over
