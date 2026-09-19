@@ -43,10 +43,14 @@ class DelvePanel(Panel):
         del self.log[:-80]
 
     def absorb(self, events) -> None:
-        interesting = [e for e in events
-                       if e.kind in ("hit", "miss", "death", "mend", "shrine")]
-        if interesting:
-            self.recent[:] = interesting
+        # Always replace, even with nothing.
+        #
+        # This only replaced when the turn had something in it, so a turn
+        # spent walking kept the last turn's blows and the board played them
+        # again, and again, every move until somebody hit something.
+        self.recent[:] = [e for e in events
+                          if e.kind in ("hit", "miss", "death", "mend",
+                                        "shrine")]
         for event in events:
             if not event.text or event.kind == "move":
                 continue

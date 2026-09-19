@@ -636,6 +636,19 @@ function draw(){
       ctx.globalAlpha=0.55*(1-(now-flash[e.id])/300);
       ctx.fillStyle='#ffd0d0'; put(img,px,py); ctx.fillRect(px,py,0,0); ctx.restore();
     }
+    /* How hurt everything is, above its head.
+       It was only in the side column, which is a list of names: you could not
+       tell by looking at the board which of three rats was nearly done, and
+       that is the whole of the decision in front of you. Drawn only once
+       something has been hurt, so an untouched room stays quiet. */
+    if(e.cap && e.hp < e.cap){
+      const w0=TILE-6, x0=px+3, y0=py-3.5, part=Math.max(0, e.hp/e.cap);
+      ctx.fillStyle='rgba(0,0,0,0.55)';
+      ctx.fillRect(x0-1, y0-1, w0+2, 4);
+      ctx.fillStyle = e.kind==='player'
+        ? (part>0.5?'#8fd8a0':part>0.25?'#e8c46a':'#e06a6a') : '#c96a6a';
+      ctx.fillRect(x0, y0, Math.round(w0*part), 2);
+    }
   });
 
   // A clearing is above ground. Torchlight falloff there would say the sun
