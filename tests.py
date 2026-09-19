@@ -823,4 +823,23 @@ assert "act('d')" in _pack_page
 assert ".side .item.spare{cursor:pointer}" in _pack_page
 ok("the one thing d would set down is clickable, and it is still one action")
 
+
+# ---------- a turn shows its own blows, not the last one's ----------
+import inspect as _ins2
+from catacomms import panel as _panelmod
+_absorb = _ins2.getsource(_panelmod.DelvePanel.absorb)
+# This only replaced when the turn had something in it, so a turn spent
+# walking kept the last turn's blows and the board played them again, and
+# again, every move until somebody hit something.
+assert "if interesting:" not in _absorb, "recent must be replaced every turn"
+assert "self.recent[:] = [" in _absorb
+ok("a turn with no blows in it clears the last turn's, instead of replaying them")
+
+_board = open("catacomms/web.py", encoding="utf-8").read()
+# The side column is a list of names: you could not tell by looking at the
+# board which of three rats was nearly done, which is the whole decision.
+assert "e.hp < e.cap" in _board, "hurt things show how hurt they are"
+assert "e.kind==='player'" in _board, "and yours is a different colour"
+ok("and anything hurt carries a bar above its head")
+
 print("\nALL PASS")
